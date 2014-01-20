@@ -56,6 +56,7 @@ struct err_string error_to_str[] = {
     { "No POSIX attributes detected" }, /* ERR_NO_POSIX */
     { "Extra attribute is a duplicate" }, /* ERR_DUP_EXTRA_ATTR */
     { "Malformed extra attribute" }, /* ERR_INVALID_EXTRA_ATTR */
+    { "User/Group SIDs not found" }, /* ERR_NO_SIDS */
 };
 
 

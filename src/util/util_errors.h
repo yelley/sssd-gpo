@@ -78,6 +78,7 @@ enum sssd_errors {
     ERR_NO_POSIX,
     ERR_DUP_EXTRA_ATTR,
     ERR_INVALID_EXTRA_ATTR,
+    ERR_NO_SIDS,
     ERR_LAST            /* ALWAYS LAST */
 };
 

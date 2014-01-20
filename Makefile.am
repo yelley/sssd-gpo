@@ -1642,6 +1642,7 @@ ad_access_filter_tests_LDADD = \
     libsss_ldap_common.la \
     libsss_idmap.la \
     libsss_krb5_common.la \
+    libsss_ad_common.la \
     libsss_test_common.la
 
 ad_common_tests_SOURCES = \
@@ -1855,6 +1856,15 @@ libsss_ldap_common_la_SOURCES += \
     src/providers/ldap/sdap_async_autofs.c
 endif
 
+pkglib_LTLIBRARIES += libsss_ad_common.la
+libsss_ad_common_la_SOURCES = \
+    $(libsss_ad_la_SOURCES)
+libsss_ad_common_la_LDFLAGS = \
+    -avoid-version
+libsss_ad_common_la_CFLAGS = \
+    $(NDR_NBT_CFLAGS)
+libsss_ad_common_la_LIBADD = \
+    $(NDR_NBT_LIBS)
 
 libsss_krb5_common_la_SOURCES = \
     src/providers/krb5/krb5_utils.c \
@@ -2010,6 +2020,8 @@ libsss_ad_la_SOURCES = \
     src/providers/ad/ad_id.h \
     src/providers/ad/ad_access.c \
     src/providers/ad/ad_access.h \
+    src/providers/ad/ad_gpo.c \
+    src/providers/ad/ad_gpo.h \
     src/providers/ad/ad_opts.h \
     src/providers/ad/ad_srv.c \
     src/providers/ad/ad_subdomains.c \
