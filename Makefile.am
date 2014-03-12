@@ -2042,7 +2042,8 @@ libsss_ad_la_CFLAGS = \
     $(SASL_CFLAGS) \
     $(DHASH_CFLAGS) \
     $(KRB5_CFLAGS) \
-    $(NDR_NBT_CFLAGS)
+    $(NDR_NBT_CFLAGS) \
+    $(SMBCLIENT_CFLAGS)
 libsss_ad_la_LIBADD = \
     $(SYSTEMD_LOGIN_LIBS) \
     $(OPENLDAP_LIBS) \
@@ -2051,9 +2052,11 @@ libsss_ad_la_LIBADD = \
     $(KEYUTILS_LIBS) \
     $(KRB5_LIBS) \
     $(NDR_NBT_LIBS) \
+    $(SMBCLIENT_LIBS) \
     libsss_ldap_common.la \
     libsss_krb5_common.la \
     libsss_idmap.la
+
 libsss_ad_la_LDFLAGS = \
     -avoid-version \
     -module

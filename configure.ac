@@ -159,6 +159,7 @@ m4_include([src/external/signal.m4])
 m4_include([src/external/inotify.m4])
 m4_include([src/external/libndr_nbt.m4])
 m4_include([src/external/sasl.m4])
+m4_include([src/external/libsmbclient.m4])
 
 WITH_UNICODE_LIB
 if test x$unicode_lib = xlibunistring; then
