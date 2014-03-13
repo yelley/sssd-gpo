@@ -70,7 +70,6 @@
 #define SMB_BUFFER_SIZE 65536
 
 #define LOCAL_INF_FILENAME PUBCONF_PATH"/GptTmpl.inf"
-#define LOCAL_TXT_FILENAME PUBCONF_PATH"/GptTmpl.txt"
 
 #define GP_EXT_GUID_SECURITY "{827D319E-6EAC-11D2-A4EA-00C04F79F83A}"
 #define GP_EXT_GUID_SECURITY_SUFFIX "/Microsoft/Windows NT/SecEdit/GptTmpl.inf"
@@ -1550,7 +1549,6 @@ parse_logon_right_with_libini(struct ini_cfgobj *ini_config,
 static errno_t
 ad_gpo_parse_gpt_tmpl_file(TALLOC_CTX *mem_ctx,
                            const char *local_inf_filename,
-                           const char *local_txt_filename,
                            char ***allowed_sids,
                            int *allowed_size,
                            char ***denied_sids,
@@ -1563,17 +1561,9 @@ ad_gpo_parse_gpt_tmpl_file(TALLOC_CTX *mem_ctx,
     int allow_size = 0; int deny_size = 0;
     char *command;
 
-    /* convert from utf-16 to utf-8 */
-    /* TBD: use ini_config after it is patched to support this conversion */
-    command = talloc_asprintf(mem_ctx,
-                              "iconv -f utf-16 -t utf-8 %s > %s",
-                              local_inf_filename,
-                              local_txt_filename);
-    system(command);
-
     ret = ini_config_create(&ini_config);
     if (ret) goto done;
-    ret = ini_config_file_open(local_txt_filename, INI_META_NONE, &file_ctx);
+    ret = ini_config_file_open(local_inf_filename, INI_META_NONE, &file_ctx);
     if (ret) goto done;
     ret = ini_config_parse(file_ctx, INI_STOP_ON_NONE, 0, 0, ini_config);
     if (ret) goto done;
@@ -1631,7 +1621,7 @@ smb_retrieve_file(TALLOC_CTX *mem_ctx,
     int ret = 0;
     FILE *fp;
     uint8_t buf[SMB_BUFFER_SIZE];
-
+    //struct ini_cfgfile *file_ctx = NULL;
 
     DEBUG(1, ("%s\n", smb_path));
     DEBUG(1, ("local_filename:: %s\n", local_filename));
@@ -1669,6 +1659,7 @@ smb_retrieve_file(TALLOC_CTX *mem_ctx,
 
     DEBUG(1, ("bytesread: %d\n", bytesread));
 
+    //    ret = ini_config_file_from_mem(buf, bytesread, &file_ctx);
 
     /* 
      * TBD: libini_config currently requires a filename for initialization,
@@ -1764,11 +1755,8 @@ ad_gpo_access_check(TALLOC_CTX *mem_ctx,
     int ret;
     int j;
 
-    char *local_txt_filename = LOCAL_TXT_FILENAME;
-
     ret = ad_gpo_parse_gpt_tmpl_file(mem_ctx,
                                      local_inf_filename,
-                                     local_txt_filename,
                                      &allowed_sids,
                                      &allowed_size,
                                      &denied_sids,
