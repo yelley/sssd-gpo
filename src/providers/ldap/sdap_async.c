@@ -1248,7 +1248,7 @@ static errno_t sdap_get_generic_ext_step(struct tevent_req *req)
     talloc_zfree(state->op);
 
     DEBUG(SSSDBG_TRACE_ALL,
-         ("calling ldap_search_ext with [%s][%s].\n",
+          "calling ldap_search_ext with [%s][%s].\n",
           state->filter ? state->filter : "no filter",
           state->search_base);
     if (DEBUG_IS_SET(SSSDBG_TRACE_LIBS)) {

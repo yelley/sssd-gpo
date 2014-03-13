@@ -361,8 +361,8 @@ ad_sdap_access_done(struct tevent_req *subreq)
         state->cindex++;
         if (state->clist[state->cindex] == NULL) {
             DEBUG(SSSDBG_OP_FAILURE,
-                  "Error retrieving access check result: %s\n",
-                  sss_strerror(ret));
+                  "Error retrieving access check result: %d %s\n",
+                   ret, sss_strerror(ret));
             tevent_req_error(req, ret);
             return;
         }
