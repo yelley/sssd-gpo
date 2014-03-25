@@ -22,6 +22,16 @@
   along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+/*
+ * This file implements the following pair of *public* functions (see header):
+ *   ad_gpo_access_send/recv: provides client-side GPO processing
+ *
+ * This file also implements the following pairs of *private* functions (which
+ * are used by the public functions):
+ *   ad_gpo_process_som_send/recv: populate list of gp_som objects
+ *   ad_gpo_process_gpo_send/recv: populate list of gp_gpo objects
+ *   ad_gpo_process_cse_send/recv: retrieves cse-specific data using smb_uri
+ */
 
 #include <security/pam_modules.h>
 #include <samba-4.0/libsmbclient.h>
@@ -72,14 +82,8 @@
 #define GP_EXT_GUID_SECURITY "{827D319E-6EAC-11D2-A4EA-00C04F79F83A}"
 #define GP_EXT_GUID_SECURITY_SUFFIX "/Microsoft/Windows NT/SecEdit/GptTmpl.inf"
 
-bool string_to_sid(struct dom_sid *sidout, const char *sidstr);
-int dom_sid_string_buf(const struct dom_sid *sid, char *buf, int buflen);
-bool dom_sid_equal(const struct dom_sid *sid1, const struct dom_sid *sid2);
 
-enum ndr_err_code
-ndr_pull_security_descriptor(struct ndr_pull *ndr,
-                             int ndr_flags,
-                             struct security_descriptor *r);
+/* == common data structures and declarations ============================= */
 
 struct gp_som {
     char *som_dn;
@@ -110,6 +114,43 @@ enum ace_eval_status {
     AD_GPO_ACE_ALLOWED,
     AD_GPO_ACE_NEUTRAL
 };
+
+struct tevent_req *ad_gpo_process_som_send(TALLOC_CTX *mem_ctx,
+                                           struct tevent_context *ev,
+                                           struct sdap_id_conn_ctx *conn,
+                                           struct sdap_id_op *sdap_op,
+                                           struct sdap_options *opts,
+                                           int timeout,
+                                           char *target_dn,
+                                           char *domain_name);
+int ad_gpo_process_som_recv(struct tevent_req *req,
+                            TALLOC_CTX *mem_ctx,
+                            struct gp_som ***som_list);
+
+struct tevent_req *ad_gpo_process_gpo_send(TALLOC_CTX *mem_ctx,
+                                           struct tevent_context *ev,
+                                           struct sdap_id_op *sdap_op,
+                                           struct sdap_options *opts,
+                                           int timeout,
+                                           struct gp_som **som_list);
+int ad_gpo_process_gpo_recv(struct tevent_req *req,
+                            TALLOC_CTX *mem_ctx,
+                            struct gp_gpo ***candidate_gpos,
+                            int *num_candidate_gpos);
+
+struct tevent_req *
+ad_gpo_process_cse_send(TALLOC_CTX *mem_ctx,
+                        struct tevent_context *ev,
+                        char *smb_uri,
+                        struct gp_gpo *cse_filtered_gpo);
+int ad_gpo_process_cse_recv(struct tevent_req *req,
+                            TALLOC_CTX *mem_ctx,
+                            char ***allowed_sids,
+                            int *allowed_size,
+                            char ***denied_sids,
+                            int *denied_size);
+
+/* == ad_gpo_access_send/recv helpers =======================================*/
 
 /*
  * This function retrieves the SIDs corresponding to the input user and returns
@@ -188,6 +229,10 @@ ad_gpo_get_sids(TALLOC_CTX *mem_ctx,
     return ret;
 }
 
+bool string_to_sid(struct dom_sid *sidout, const char *sidstr);
+int dom_sid_string_buf(const struct dom_sid *sid, char *buf, int buflen);
+bool dom_sid_equal(const struct dom_sid *sid1, const struct dom_sid *sid2);
+
 /*
  * This function determines whether the input ACE includes any of the
  * client's SIDs. The boolean result is assigned to the _included output param.
@@ -225,61 +270,6 @@ ad_gpo_ace_includes_client_sid(const char *user_sid,
             return EINVAL;
         }
         if (dom_sid_equal(&ace_dom_sid, &group_dom_sid)) {
-            *_included = true;
-            return EOK;
-        }
-    }
-
-    *_included = false;
-    return EOK;
-}
-
-/*
- * This function determines whether the input ACE includes any of the
- * client's SIDs. The boolean result is assigned to the _included output param.
- */
-static errno_t
-ad_gpo_includes_cse_guid(const char *cse_guid,
-                         char **gpo_cse_guids,
-                         int num_gpo_cse_guids,
-                         bool *_included)
-{
-    int i = 0;
-    char *gpo_cse_guid = NULL;
-
-    for (i = 0; i < num_gpo_cse_guids; i++) {
-        if (gpo_cse_guids[i] == NULL) {
-            DEBUG(1, "null\n");
-        }
-        gpo_cse_guid = gpo_cse_guids[i];
-        if (strcmp(gpo_cse_guid, cse_guid) == 0) {
-            *_included = true;
-            return EOK;
-        }
-    }
-    *_included = false;
-    return EOK;
-}
-
-/*
- * This function determines whether the input ACE includes any of the
- * client's SIDs. The boolean result is assigned to the _included output param.
- */
-static errno_t
-ad_gpo_includes_cse_guid(const char *cse_guid,
-                         char **gpo_cse_guids,
-                         int num_gpo_cse_guids,
-                         bool *_included)
-{
-    int i = 0;
-    char *gpo_cse_guid = NULL;
-
-    for (i = 0; i < num_gpo_cse_guids; i++) {
-        if (gpo_cse_guids[i] == NULL) {
-            DEBUG(1, "null\n");
-        }
-        gpo_cse_guid = gpo_cse_guids[i];
-        if (strcmp(gpo_cse_guid, cse_guid) == 0) {
             *_included = true;
             return EOK;
         }
@@ -360,36 +350,6 @@ static enum ace_eval_status ad_gpo_evaluate_ace(struct security_ace *ace,
 }
 
 /*
- * This function parses the input data blob and assigns the resulting
- * security_descriptor object to the _gpo_sd output parameter.
- */
-static errno_t ad_gpo_parse_sd(TALLOC_CTX *mem_ctx,
-                               uint8_t *data,
-                               size_t length,
-                               struct security_descriptor **_gpo_sd)
-{
-
-    struct ndr_pull *ndr_pull = NULL;
-    struct security_descriptor sd;
-    DATA_BLOB blob;
-
-    blob.data = data;
-    blob.length = length;
-
-    ndr_pull = ndr_pull_init_blob(&blob, mem_ctx);
-    if (ndr_pull == NULL) {
-        DEBUG(SSSDBG_OP_FAILURE, "ndr_pull_init_blob() failed.\n");
-        return EINVAL;
-    }
-
-    ndr_pull_security_descriptor(ndr_pull, NDR_SCALARS|NDR_BUFFERS, &sd);
-
-    *_gpo_sd = talloc_memdup(mem_ctx, &sd, sizeof(struct security_descriptor));
-
-    return EOK;
-}
-
-/*
  * This function extracts the GPO's DACL (discretionary access control list)
  * from the GPO's specified security descriptor, and determines whether
  * the GPO is applicable to the policy target, by comparing the specified
@@ -441,22 +401,50 @@ static errno_t ad_gpo_evaluate_dacl(struct security_acl *dacl,
 }
 
 /*
- * This function takes an input gpo_list, filters out any gpo that does
- * not contain the input cse_guid, and assigns the result to the
+ * This function determines whether the input ACE includes any of the
+ * client's SIDs. The boolean result is assigned to the _included output param.
+ */
+static errno_t
+ad_gpo_includes_cse_guid(const char *cse_guid,
+                         char **gpo_cse_guids,
+                         int num_gpo_cse_guids,
+                         bool *_included)
+{
+    int i = 0;
+    char *gpo_cse_guid = NULL;
+
+    for (i = 0; i < num_gpo_cse_guids; i++) {
+        if (gpo_cse_guids[i] == NULL) {
+            DEBUG(SSSDBG_CRIT_FAILURE, "null\n");
+        }
+        gpo_cse_guid = gpo_cse_guids[i];
+        if (strcmp(gpo_cse_guid, cse_guid) == 0) {
+            *_included = true;
+            return EOK;
+        }
+    }
+
+    *_included = false;
+    return EOK;
+}
+
+/*
+ * This function takes an input dacl_filtered_gpos list, filters out any gpo
+ * that does not contain the input cse_guid, and assigns the result to the
  * _cse_filtered_gpos output parameter.
  */
 static errno_t
 ad_gpo_filter_gpos_by_cse_guid(TALLOC_CTX *mem_ctx,
                                const char *cse_guid,
-                               struct gp_gpo **filtered_gpos,
-                               int num_filtered_gpos,
+                               struct gp_gpo **dacl_filtered_gpos,
+                               int num_dacl_filtered_gpos,
                                struct gp_gpo ***_cse_filtered_gpos,
                                int *_num_cse_filtered_gpos)
 {
     TALLOC_CTX *tmp_ctx = NULL;
     int i = 0;
     int ret = 0;
-    struct gp_gpo *filtered_gpo = NULL;
+    struct gp_gpo *dacl_filtered_gpo = NULL;
     int gpo_dn_idx = 0;
     struct gp_gpo **cse_filtered_gpos = NULL;
     bool included;
@@ -469,35 +457,35 @@ ad_gpo_filter_gpos_by_cse_guid(TALLOC_CTX *mem_ctx,
 
     cse_filtered_gpos = talloc_array(tmp_ctx,
                                      struct gp_gpo *,
-                                     num_filtered_gpos + 1);
+                                     num_dacl_filtered_gpos + 1);
     if (cse_filtered_gpos == NULL) {
         ret = ENOMEM;
         goto done;
     }
 
-    for (i = 0; i < num_filtered_gpos; i++) {
+    for (i = 0; i < num_dacl_filtered_gpos; i++) {
 
-        filtered_gpo = filtered_gpos[i];
-        if (filtered_gpo == NULL) {
-            DEBUG(1, "filtered_gpo is null\n");
+        dacl_filtered_gpo = dacl_filtered_gpos[i];
+        if (dacl_filtered_gpo == NULL) {
+            DEBUG(SSSDBG_CRIT_FAILURE, "dacl_filtered_gpo is null\n");
         }
 
         DEBUG(SSSDBG_TRACE_ALL, "examining cse candidate_gpo_guid: %s\n",
-              filtered_gpo->gpo_guid);
+              dacl_filtered_gpo->gpo_guid);
 
-        if (filtered_gpo->gpo_cse_guids[0] == NULL) {
-            DEBUG(SSSDBG_TRACE_ALL, "filtered_gpo->gpo_cse_guids[0] is null\n");
+        if (dacl_filtered_gpo->gpo_cse_guids[0] == NULL) {
+            DEBUG(SSSDBG_TRACE_ALL, "dacl_filtered_gpo->gpo_cse_guids[0] is null\n");
         }
 
         ret = ad_gpo_includes_cse_guid(cse_guid,
-                                       filtered_gpo->gpo_cse_guids,
-                                       filtered_gpo->num_gpo_cse_guids,
+                                       dacl_filtered_gpo->gpo_cse_guids,
+                                       dacl_filtered_gpo->num_gpo_cse_guids,
                                        &included);
         if (included) {
             DEBUG(SSSDBG_TRACE_ALL,
                   "GPO applicable to target per cse_guid filtering\n");
             cse_filtered_gpos[gpo_dn_idx] = talloc_steal(cse_filtered_gpos,
-                                                         filtered_gpo);
+                                                         dacl_filtered_gpo);
             gpo_dn_idx++;
         } else {
             DEBUG(SSSDBG_TRACE_ALL,
@@ -520,7 +508,7 @@ ad_gpo_filter_gpos_by_cse_guid(TALLOC_CTX *mem_ctx,
 /*
  * This function takes candidate_gpos as input, filters out any gpo that is
  * not applicable to the policy target and assigns the result to the
- * _filtered_gpos output parameter. The filtering algorithm is
+ * _dacl_filtered_gpos output parameter. The filtering algorithm is
  * defined in [MS-GPOL] 3.2.5.1.6
  */
 
@@ -530,8 +518,8 @@ ad_gpo_filter_gpos_by_dacl(TALLOC_CTX *mem_ctx,
                            struct sss_domain_info *domain,
                            struct gp_gpo **candidate_gpos,
                            int num_candidate_gpos,
-                           struct gp_gpo ***_filtered_gpos,
-                           int *_num_filtered_gpos)
+                           struct gp_gpo ***_dacl_filtered_gpos,
+                           int *_num_dacl_filtered_gpos)
 {
     TALLOC_CTX *tmp_ctx = NULL;
     int i = 0;
@@ -544,7 +532,7 @@ ad_gpo_filter_gpos_by_dacl(TALLOC_CTX *mem_ctx,
     int group_size = 0;
     int gpo_dn_idx = 0;
     bool access_allowed = false;
-    struct gp_gpo **filtered_gpos = NULL;
+    struct gp_gpo **dacl_filtered_gpos = NULL;
 
     tmp_ctx = talloc_new(NULL);
     if (tmp_ctx == NULL) {
@@ -561,11 +549,11 @@ ad_gpo_filter_gpos_by_dacl(TALLOC_CTX *mem_ctx,
         goto done;
     }
 
-    filtered_gpos = talloc_array(tmp_ctx,
+    dacl_filtered_gpos = talloc_array(tmp_ctx,
                                  struct gp_gpo *,
                                  num_candidate_gpos + 1);
 
-    if (filtered_gpos == NULL) {
+    if (dacl_filtered_gpos == NULL) {
         ret = ENOMEM;
         goto done;
     }
@@ -611,8 +599,8 @@ ad_gpo_filter_gpos_by_dacl(TALLOC_CTX *mem_ctx,
         if (access_allowed) {
             DEBUG(SSSDBG_TRACE_ALL,
                   "GPO applicable to target per security filtering\n");
-            filtered_gpos[gpo_dn_idx] = talloc_steal(filtered_gpos,
-                                                     candidate_gpo);
+            dacl_filtered_gpos[gpo_dn_idx] = talloc_steal(dacl_filtered_gpos,
+                                                          candidate_gpo);
             gpo_dn_idx++;
         } else {
             DEBUG(SSSDBG_TRACE_ALL,
@@ -621,10 +609,10 @@ ad_gpo_filter_gpos_by_dacl(TALLOC_CTX *mem_ctx,
         }
     }
 
-    filtered_gpos[gpo_dn_idx] = NULL;
+    dacl_filtered_gpos[gpo_dn_idx] = NULL;
 
-    *_filtered_gpos = talloc_steal(mem_ctx, filtered_gpos);
-    *_num_filtered_gpos = gpo_dn_idx;
+    *_dacl_filtered_gpos = talloc_steal(mem_ctx, dacl_filtered_gpos);
+    *_num_dacl_filtered_gpos = gpo_dn_idx;
 
     ret = EOK;
 
@@ -634,101 +622,636 @@ ad_gpo_filter_gpos_by_dacl(TALLOC_CTX *mem_ctx,
 }
 
 /*
- * This function populates the _cse_guid_list output parameter by parsing the
- * input raw_machine_ext_names_value into an array of cse_guid strings.
+ * This cse-specific function (GP_EXT_GUID_SECURITY) populates the output found
+ * parameter based on whether the input user_sid or any of the input group_sids
+ * appear in the input list of privilege_sids.
+ */
+static void
+check_rights(char **privilege_sids,
+             int privilege_size,
+             const char *user_sid,
+             const char **group_sids,
+             int group_size,
+             int *found)
+{
+  int match = 0;
+  int i, j;
+
+  for (i = 0; i < privilege_size; i++) {
+    if (strcmp(user_sid, privilege_sids[i]) == 0) {
+      match = 1;
+      break;
+    }
+    for (j = 0; j < group_size; j++) {
+      if (strcmp(group_sids[j], privilege_sids[i]) == 0) {
+	match = 1;
+	break;
+      }
+    }
+  }
+
+  *found = match;
+}
+
+/*
+ * This cse-specific function (GP_EXT_GUID_SECURITY) performs HBAC policy
+ * application and determines whether logon access is granted or denied for
+ * the {user,domain} tuple specified in the inputs. This function returns EOK
+ * to indicate that access is granted. Any other return value indicates that
+ * access is denied.
  *
- * The raw_machine_ext_names_value is a single string in the following format:
- * "[{cse_guid_1}{tool_guid1}]...[{cse_guid_n}{tool_guid_n}]"
+ * The access control algorithm first determines whether the "principal_sids"
+ * (i.e. user_sid or group_sids) appear in allowed_sids and denied_sids.
+ *
+ * For access to be granted, both the "allowed_sids_condition" *and* the
+ * "denied_sids_condition" must be met (in all other cases, access is denied).
+ * 1) The "allowed_sids_condition" is satisfied if any of the principal_sids
+ *    appears in allowed_sids OR if the allowed_sids list is empty
+ * 2) The "denied_sids_condition" is satisfied if none of the principal_sids
+ *    appear in denied_sids
+ *
+ * By default, neither allowed_sids nor denied_sids are specified. As such, a
+ * deployment that is unaware of GPO-based access-control policy settings is
+ * unaffected by them (b/c the absence of allowed_sids grants access).
+ *
+ * Note that if a principal_sid appears in both allowed_sids and denied_sids,
+ * the "allowed_sids_condition" is met, but the "denied_sids_condition" is not.
+ * In other words, Deny takes precedence over Allow.
  */
 static errno_t
-ad_gpo_parse_machine_ext_names(TALLOC_CTX *mem_ctx,
-                               char *raw_machine_ext_names_value,
-                               char ***_gpo_cse_guids,
-                               int *_num_gpo_cse_guids)
+ad_gpo_access_check(TALLOC_CTX *mem_ctx,
+                    char *user,
+                    struct sss_domain_info *domain,
+                    char **allowed_sids,
+                    int allowed_size,
+                    char **denied_sids,
+                    int denied_size)
 {
-    TALLOC_CTX *tmp_ctx = NULL;
-    char *ptr;
-    char *first;
-    char *last;
-    char *cse_guid;
-    char *tool_guid;
-    const char delim = ']';
-    char **gpo_cse_guids;
-    int i;
+    const char *user_sid;
+    const char **group_sids;
+    int group_size = 0;
+    int access_granted = 0;
+    int access_denied = 0;
     int ret;
-    int num_gpo_cse_guids = 0;
+    int j;
 
-    if (raw_machine_ext_names_value == NULL ||
-        *raw_machine_ext_names_value == '\0' ||
-        _gpo_cse_guids == NULL) {
-        return EINVAL;
+    DEBUG(SSSDBG_CRIT_FAILURE, "POLICY FILE:\n");
+    DEBUG(SSSDBG_CRIT_FAILURE, "allowed_size = %d\n", allowed_size);
+    for (j= 0; j < allowed_size; j++) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "allowed_sids[%d] = %s\n", j,
+              allowed_sids[j]);
     }
 
-    tmp_ctx = talloc_new(NULL);
-    if (tmp_ctx == NULL) {
+    DEBUG(SSSDBG_CRIT_FAILURE, "denied_size = %d\n", denied_size);
+    for (j= 0; j < denied_size; j++) {
+        DEBUG(SSSDBG_CRIT_FAILURE, " denied_sids[%d] = %s\n", j,
+              denied_sids[j]);
+    }
+
+    ret = ad_gpo_get_sids(mem_ctx, user, domain, &user_sid,
+                          &group_sids, &group_size);
+    if (ret) goto done;
+
+    DEBUG(SSSDBG_CRIT_FAILURE, "CURRENT USER:\n");
+    DEBUG(SSSDBG_CRIT_FAILURE, "       user_sid = %s\n", user_sid);
+
+    for (j= 0; j < group_size; j++) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "  group_sids[%d] = %s\n", j,
+              group_sids[j]);
+    }
+
+    /* If AllowLogonLocally is not defined, all users are allowed */
+    if (allowed_size == 0) {
+      access_granted = 1;
+    }  else {
+      check_rights(allowed_sids, allowed_size, user_sid,
+                   group_sids, group_size, &access_granted);
+    }
+
+    DEBUG(SSSDBG_CRIT_FAILURE, " access_granted = %d\n", access_granted);
+
+    check_rights(denied_sids, denied_size, user_sid,
+                 group_sids, group_size, &access_denied);
+    DEBUG(SSSDBG_CRIT_FAILURE, "  access_denied = %d\n", access_denied);
+
+    if (access_granted && !access_denied) {
+        return EOK;
+    } else {
+        return EACCES;
+    }
+
+ done:
+
+    if (ret) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "Error encountered: %d.\n", ret);
+    }
+
+    return ret;
+}
+
+/* == ad_gpo_access_send/recv implementation ================================*/
+
+struct ad_gpo_access_state {
+    struct tevent_context *ev;
+    struct sdap_id_conn_ctx *conn;
+    struct sdap_id_op *sdap_op;
+    struct sdap_options *opts;
+    int timeout;
+    struct sss_domain_info *domain;
+    char *user;
+    char *ad_hostname;
+    char *target_dn;
+    struct gp_gpo **dacl_filtered_gpos;
+    int num_dacl_filtered_gpos;
+    struct gp_gpo **cse_filtered_gpos;
+    int num_cse_filtered_gpos;
+    int cse_gpo_index;
+};
+
+static void ad_gpo_connect_done(struct tevent_req *subreq);
+static void ad_gpo_target_dn_retrieval_done(struct tevent_req *subreq);
+static void ad_gpo_process_som_done(struct tevent_req *subreq);
+static void ad_gpo_process_gpo_done(struct tevent_req *subreq);
+static errno_t ad_gpo_cse_step(struct tevent_req *req);
+static void ad_gpo_cse_done(struct tevent_req *subreq);
+
+struct tevent_req *
+ad_gpo_access_send(TALLOC_CTX *mem_ctx,
+                   struct tevent_context *ev,
+                   struct sss_domain_info *domain,
+                   struct ad_access_ctx *ctx,
+                   char *user)
+{
+    struct tevent_req *req;
+    struct tevent_req *subreq;
+    struct ad_gpo_access_state *state;
+    errno_t ret;
+
+    req = tevent_req_create(mem_ctx, &state, struct ad_gpo_access_state);
+    if (req == NULL) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "tevent_req_create() failed\n");
+        return NULL;
+    }
+
+    state->domain = domain;
+    state->dacl_filtered_gpos = NULL;
+    state->num_dacl_filtered_gpos = 0;
+    state->cse_filtered_gpos = NULL;
+    state->num_cse_filtered_gpos = 0;
+    state->cse_gpo_index = -1;
+    state->ev = ev;
+    state->user = user;
+    state->ad_hostname = dp_opt_get_string(ctx->ad_options, AD_HOSTNAME);
+    state->opts = ctx->sdap_access_ctx->id_ctx->opts;
+    state->timeout = dp_opt_get_int(state->opts->basic, SDAP_SEARCH_TIMEOUT);
+    state->conn = ad_get_dom_ldap_conn(ctx->ad_id_ctx, domain);
+    state->sdap_op = sdap_id_op_create(state, state->conn->conn_cache);
+    if (state->sdap_op == NULL) {
+        DEBUG(SSSDBG_OP_FAILURE, "sdap_id_op_create failed.\n");
+        ret = ENOMEM;
+        goto immediately;
+    }
+
+    subreq = sdap_id_op_connect_send(state->sdap_op, state, &ret);
+    if (subreq == NULL) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              "sdap_id_op_connect_send failed: [%d](%s)\n",
+               ret, strerror(ret));
+        goto immediately;
+    }
+    tevent_req_set_callback(subreq, ad_gpo_connect_done, req);
+
+    ret = EOK;
+
+immediately:
+
+    if (ret != EOK) {
+        tevent_req_error(req, ret);
+        tevent_req_post(req, ev);
+    }
+
+    return req;
+}
+
+static void
+ad_gpo_connect_done(struct tevent_req *subreq)
+{
+    struct tevent_req *req;
+    struct ad_gpo_access_state *state;
+    char* filter;
+    char *sam_account_name;
+    char *domain_dn;
+    int dp_error;
+    errno_t ret;
+
+    const char *attrs[] = {AD_AT_DN, AD_AT_UAC, NULL};
+
+    req = tevent_req_callback_data(subreq, struct tevent_req);
+    state = tevent_req_data(req, struct ad_gpo_access_state);
+
+    ret = sdap_id_op_connect_recv(subreq, &dp_error);
+    talloc_zfree(subreq);
+
+    if (ret != EOK) {
+        /* TBD: handle (dp_error == DP_ERR_OFFLINE) case */
+
+        DEBUG(SSSDBG_OP_FAILURE,
+              "Failed to connect to AD server: [%d](%s)\n",
+               ret, strerror(ret));
+
+        tevent_req_error(req, ret);
+        return;
+    }
+
+    sam_account_name = talloc_asprintf(state, "%s$", state->ad_hostname);
+    if (sam_account_name == NULL) {
+        tevent_req_error(req, ENOMEM);
+        return;
+    }
+
+    DEBUG(SSSDBG_TRACE_FUNC, "sam_account_name is %s\n", sam_account_name);
+
+    /* Convert the domain name into domain DN */
+    ret = domain_to_basedn(state, state->domain->name, &domain_dn);
+    if (ret != EOK) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              "Cannot convert domain name [%s] to base DN [%d]: %s\n",
+               state->domain->name, ret, strerror(ret));
+        tevent_req_error(req, ret);
+        return;
+    }
+
+    /* SDAP_OC_USER objectclass covers both users and computers */
+    filter = talloc_asprintf(state,
+                             "(&(objectclass=%s)(%s=%s))",
+                             state->opts->user_map[SDAP_OC_USER].name,
+                             state->opts->user_map[SDAP_AT_USER_NAME].name,
+                             sam_account_name);
+
+    if (filter == NULL) {
+        tevent_req_error(req, ENOMEM);
+        return;
+    }
+
+    subreq = sdap_get_generic_send(state, state->ev, state->opts,
+                                   sdap_id_op_handle(state->sdap_op),
+                                   domain_dn, LDAP_SCOPE_SUBTREE,
+                                   filter, attrs, NULL, 0,
+                                   state->timeout,
+                                   false);
+
+    if (subreq == NULL) {
+        DEBUG(SSSDBG_OP_FAILURE, "sdap_get_generic_send failed.\n");
+        tevent_req_error(req, EIO);
+        return;
+    }
+
+    tevent_req_set_callback(subreq, ad_gpo_target_dn_retrieval_done, req);
+}
+
+static void
+ad_gpo_target_dn_retrieval_done(struct tevent_req *subreq)
+{
+    struct tevent_req *req;
+    struct ad_gpo_access_state *state;
+    int ret;
+    int dp_error;
+    size_t reply_count;
+    struct sysdb_attrs **reply;
+    const char *target_dn = NULL;
+
+    req = tevent_req_callback_data(subreq, struct tevent_req);
+    state = tevent_req_data(req, struct ad_gpo_access_state);
+    ret = sdap_get_generic_recv(subreq, state,
+                                &reply_count, &reply);
+    talloc_zfree(subreq);
+    if (ret != EOK) {
+        ret = sdap_id_op_done(state->sdap_op, ret, &dp_error);
+        /* TBD: handle (dp_error == DP_ERR_OFFLINE) case */
+
+        DEBUG(SSSDBG_OP_FAILURE,
+              "Unable to get policy target's DN: [%d](%s)\n",
+               ret, strerror(ret));
+        ret = ENOENT;
+        goto done;
+    }
+
+    /* make sure there is only one non-NULL reply returned */
+
+    if (reply_count < 1) {
+        DEBUG(SSSDBG_OP_FAILURE, "No DN retrieved for policy target.\n");
+        ret = ENOENT;
+        goto done;
+    } else if (reply_count > 1) {
+        DEBUG(SSSDBG_OP_FAILURE, "Multiple replies for policy target\n");
+        ret = ERR_INTERNAL;
+        goto done;
+    } else if (reply == NULL) {
+        DEBUG(SSSDBG_OP_FAILURE, "reply_count is 1, but reply is NULL\n");
+        ret = ERR_INTERNAL;
+        goto done;
+    }
+
+    /* reply[0] holds requested attributes of single reply */
+    ret = sysdb_attrs_get_string(reply[0], AD_AT_DN, &target_dn);
+    if (ret != EOK) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              "sysdb_attrs_get_string failed: [%d](%s)\n",
+               ret, strerror(ret));
+        goto done;
+    }
+
+    state->target_dn = talloc_strdup(state, target_dn);
+    if (state->target_dn == NULL) {
         ret = ENOMEM;
         goto done;
     }
 
-    ptr = raw_machine_ext_names_value;
-    if (ptr == NULL) {
-        ret = ENOMEM;
+    uint32_t uac;
+    ret = sysdb_attrs_get_uint32_t(reply[0], AD_AT_UAC, &uac);
+    if (ret != EOK) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              "sysdb_attrs_get_uint32_t failed: [%d](%s)\n",
+               ret, strerror(ret));
         goto done;
     }
 
-    while ((ptr = strchr(ptr, delim))) {
-        if (ptr == NULL) break;
-        ptr++;
-        num_gpo_cse_guids++;
-    }
-
-    if (num_gpo_cse_guids == 0) {
+    /* we only support computer policy targets, not users */
+    if (!(uac & UAC_WORKSTATION_TRUST_ACCOUNT)) {
         ret = EINVAL;
         goto done;
     }
 
-    gpo_cse_guids = talloc_array(tmp_ctx, char *, num_gpo_cse_guids + 1);
-    if (gpo_cse_guids == NULL) {
+    state->target_dn = talloc_strdup(state, target_dn);
+    if (state->target_dn == NULL) {
         ret = ENOMEM;
         goto done;
     }
 
-    ptr = raw_machine_ext_names_value;
-    for (i = 0; i < num_gpo_cse_guids; i++) {
-        first = ptr + 1;
-        last = strchr(first, delim);
-        if (last == NULL) {
-            break;
-        }
-        *last = '\0';
-        last++;
-        cse_guid = first;
-        first ++;
-        tool_guid = strchr(first, '{');
-        if (tool_guid == NULL) {
-            break;
-        }
-        *tool_guid = '\0';
-        gpo_cse_guids[i] = talloc_strdup(gpo_cse_guids, cse_guid);
-        ptr = last;
-    }
-    gpo_cse_guids[i] = NULL;
-
-    DEBUG(SSSDBG_TRACE_ALL, "num_gpo_cse_guids: %d\n", num_gpo_cse_guids);
-
-    for (i = 0; i < num_gpo_cse_guids; i++) {
-        DEBUG(SSSDBG_TRACE_ALL,
-              "gpo_cse_guids[%d] is %s\n", i, gpo_cse_guids[i]);
+    subreq = ad_gpo_process_som_send(state,
+                                     state->ev,
+                                     state->conn,
+                                     state->sdap_op,
+                                     state->opts,
+                                     state->timeout,
+                                     state->target_dn,
+                                     state->domain->name);
+    if (subreq == NULL) {
+        ret = ENOMEM;
+        goto done;
     }
 
-    *_gpo_cse_guids = talloc_steal(mem_ctx, gpo_cse_guids);
-    *_num_gpo_cse_guids = num_gpo_cse_guids;
-    ret = EOK;
+    tevent_req_set_callback(subreq, ad_gpo_process_som_done, req);
 
  done:
-    talloc_free(tmp_ctx);
-    return ret;
+
+    if (ret != EOK) {
+        tevent_req_error(req, ret);
+    }
 }
+
+static void
+ad_gpo_process_som_done(struct tevent_req *subreq)
+{
+    struct tevent_req *req;
+    struct ad_gpo_access_state *state;
+    int ret;
+    struct gp_som **som_list;
+
+    req = tevent_req_callback_data(subreq, struct tevent_req);
+    state = tevent_req_data(req, struct ad_gpo_access_state);
+    ret = ad_gpo_process_som_recv(subreq, state, &som_list);
+    talloc_zfree(subreq);
+
+    if (ret != EOK) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              "Unable to get som list: [%d](%s)\n",
+               ret, strerror(ret));
+        ret = ENOENT;
+        goto done;
+    }
+
+    subreq = ad_gpo_process_gpo_send(state,
+                                     state->ev,
+                                     state->sdap_op,
+                                     state->opts,
+                                     state->timeout,
+                                     som_list);
+    if (subreq == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+
+    tevent_req_set_callback(subreq, ad_gpo_process_gpo_done, req);
+
+ done:
+
+    if (ret != EOK) {
+        tevent_req_error(req, ret);
+    }
+}
+
+/*
+ * This function retrieves a list of candidate_gpos and potentially reduces it
+ * to a list of dacl_filtered_gpos, based on each GPO's DACL.
+ *
+ * This function then takes the list of dacl_filtered_gpos and potentially
+ * reduces it to a list of cse_filtered_gpos, based on whether each GPO's list
+ * of cse_guids includes the "SecuritySettings" CSE GUID (used for HBAC).
+ *
+ * This function then sends each cse_filtered_gpo to the CSE processing engine
+ * for policy application, which currently consists of HBAC functionality.
+ */
+static void
+ad_gpo_process_gpo_done(struct tevent_req *subreq)
+{
+    struct tevent_req *req;
+    struct ad_gpo_access_state *state;
+    int ret;
+    int dp_error;
+    struct gp_gpo **candidate_gpos = NULL;
+    int num_candidate_gpos = 0;
+    int i = 0;
+
+    req = tevent_req_callback_data(subreq, struct tevent_req);
+    state = tevent_req_data(req, struct ad_gpo_access_state);
+    ret = ad_gpo_process_gpo_recv(subreq, state, &candidate_gpos,
+                                  &num_candidate_gpos);
+
+    talloc_zfree(subreq);
+
+    ret = sdap_id_op_done(state->sdap_op, ret, &dp_error);
+
+    if (ret != EOK) {
+        /* TBD: handle (dp_error == DP_ERR_OFFLINE) case */
+
+        DEBUG(SSSDBG_OP_FAILURE,
+              "Unable to get GPO list: [%d](%s)\n",
+              ret, strerror(ret));
+        ret = ENOENT;
+        goto done;
+    }
+
+    ret = ad_gpo_filter_gpos_by_dacl(state, state->user, state->domain,
+                                     candidate_gpos, num_candidate_gpos,
+                                     &state->dacl_filtered_gpos,
+                                     &state->num_dacl_filtered_gpos);
+    if (ret != EOK) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              "Unable to filter GPO list: [%d](%s)\n",
+              ret, strerror(ret));
+        goto done;
+    }
+
+    if (state->dacl_filtered_gpos[0] == NULL) {
+        DEBUG(SSSDBG_TRACE_FUNC, "dacl_filtered_gpos is empty\n");
+    }
+
+    for (i = 0; i < state->num_dacl_filtered_gpos; i++) {
+        DEBUG(SSSDBG_TRACE_FUNC, "dacl_filtered_gpos[%d]->gpo_guid is %s\n", i,
+              state->dacl_filtered_gpos[i]->gpo_guid);
+    }
+
+
+    ret = ad_gpo_filter_gpos_by_cse_guid(state,
+                                         GP_EXT_GUID_SECURITY,
+                                         state->dacl_filtered_gpos,
+                                         state->num_dacl_filtered_gpos,
+                                         &state->cse_filtered_gpos,
+                                         &state->num_cse_filtered_gpos);
+
+    if (ret != EOK) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              "Unable to filter GPO list by CSE_GUID: [%d](%s)\n",
+               ret, strerror(ret));
+        goto done;
+    }
+
+    for (i = 0; i < state->num_cse_filtered_gpos; i++) {
+        DEBUG(SSSDBG_TRACE_FUNC, "cse_filtered_gpos[%d]->gpo_guid is %s\n", i,
+                                  state->cse_filtered_gpos[i]->gpo_guid);
+    }
+
+    DEBUG(SSSDBG_TRACE_FUNC, "time for SMB retrieval\n");
+
+    DEBUG(SSSDBG_TRACE_FUNC, "num_cse_filtered_gpos: %d\n",
+          state->num_cse_filtered_gpos);
+
+    ret = ad_gpo_cse_step(req);
+
+ done:
+
+    if (ret == EOK) {
+        tevent_req_done(req);
+    } else if (ret != EAGAIN) {
+        tevent_req_error(req, ret);
+    }
+}
+
+static errno_t ad_gpo_cse_step(struct tevent_req *req)
+{
+    struct tevent_req *subreq;
+    struct ad_gpo_access_state *state;
+    char *smb_uri;
+    int i = 0;
+
+    state = tevent_req_data(req, struct ad_gpo_access_state);
+
+    state->cse_gpo_index++;
+    struct gp_gpo *cse_filtered_gpo =
+        state->cse_filtered_gpos[state->cse_gpo_index];
+
+    /* gp_gpo is NULL only after all GPOs have been processed */
+    if (cse_filtered_gpo == NULL) return EOK;
+
+    DEBUG(SSSDBG_TRACE_FUNC, "cse filtered_gpos[%d]->gpo_guid is %s\n",
+          state->cse_gpo_index, cse_filtered_gpo->gpo_guid);
+    DEBUG(SSSDBG_TRACE_FUNC, "cse filtered_gpos[%d]->file_sys_path is %s\n",
+          state->cse_gpo_index, cse_filtered_gpo->gpo_file_sys_path);
+    for (i = 0; i < cse_filtered_gpo->num_gpo_cse_guids; i++) {
+        DEBUG(SSSDBG_TRACE_ALL,
+              "cse_filtered_gpos[%d]->gpo_cse_guids[%d]->gpo_guid is %s\n",
+              state->cse_gpo_index, i, cse_filtered_gpo->gpo_cse_guids[i]);
+    }
+
+    smb_uri = talloc_asprintf(state, "%s%s",
+                              cse_filtered_gpo->gpo_file_sys_path,
+                              GP_EXT_GUID_SECURITY_SUFFIX);
+
+    subreq = ad_gpo_process_cse_send(state, state->ev, smb_uri, cse_filtered_gpo);
+
+    tevent_req_set_callback(subreq, ad_gpo_cse_done, req);
+    return EAGAIN;
+}
+
+/*
+ * This cse-specific function (GP_EXT_GUID_SECURITY) retrieves a list of
+ * allowed_sids and denied_sids, and uses them to determine whether logon
+ * access is granted or denied for the state's {user, domain} tuple.
+ *
+ * If it is determined that the current cse_filtered_gpo grants access, then
+ * we process the next cse_filtered_gpo in the list. At any time, if access is
+ * denied, we return immediately with an error.
+ */
+static void
+ad_gpo_cse_done(struct tevent_req *subreq)
+{
+    struct tevent_req *req;
+    struct ad_gpo_access_state *state;
+    int ret;
+    char **allowed_sids;
+    int allowed_size;
+    char **denied_sids;
+    int denied_size;
+
+    req = tevent_req_callback_data(subreq, struct tevent_req);
+    state = tevent_req_data(req, struct ad_gpo_access_state);
+
+    ret = ad_gpo_process_cse_recv(subreq, state, &allowed_sids, &allowed_size,
+                                  &denied_sids, &denied_size);
+
+    talloc_zfree(subreq);
+
+    if (ret != EOK) {
+        /* TBD: handle ret error  */
+        goto done;
+    }
+
+    /* TBD: allowed/denied_sids/size, should be retrieved from cache */
+    ret = ad_gpo_access_check
+        (state, state->user, state->domain,
+         allowed_sids, allowed_size, denied_sids, denied_size);
+
+    if (ret == EOK) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "ret is EOK\n");
+    } else {
+        DEBUG(SSSDBG_CRIT_FAILURE, "ret is not EOK\n");
+        DEBUG(SSSDBG_OP_FAILURE,
+              "GPO check failed: [%d](%s)\n",
+              ret, strerror(ret));
+        goto done;
+    }
+
+    ret = ad_gpo_cse_step(req);
+
+ done:
+
+    if (ret == EOK) {
+        tevent_req_done(req);
+    } else if (ret != EAGAIN) {
+        tevent_req_error(req, ret);
+    }
+}
+
+errno_t
+ad_gpo_access_recv(struct tevent_req *req)
+{
+    TEVENT_REQ_RETURN_ON_ERROR(req);
+
+    return EOK;
+}
+
+/* == ad_gpo_process_som_send/recv helpers ================================= */
 
 /*
  * This function returns the parent of an LDAP DN
@@ -750,90 +1273,27 @@ static char *ad_gpo_parent_dn(const char *dn)
 }
 
 /*
- * This function populates the _cse_guid_list output parameter by parsing the
- * input raw_machine_ext_names_value into an array of cse_guid strings.
- *
- * The raw_machine_ext_names_value is a single string in the following format:
- * "[{cse_guid_1}{tool_guid1}]...[{cse_guid_n}{tool_guid_n}]"
+ * This function populates the _som_list output parameter by parsing the input
+ * DN into a list of gp_som objects. This function essentially repeatedly
+ * appends the input DN's parent to the SOM List (if the parent starts with
+ * "OU=" or "DC="), until the first "DC=" component is reached.
+ * Example: if input DN is "CN=MyComputer,CN=Computers,OU=Sales,DC=FOO,DC=COM",
+ * then SOM List has 2 SOM entries: {[OU=Sales,DC=FOO,DC=COM], [DC=FOO, DC=COM]}
  */
+
 static errno_t
-ad_gpo_convert_to_smb_uri(TALLOC_CTX *mem_ctx,
-                          char *input_path,
-                          char **_converted_path)
+ad_gpo_populate_som_list(TALLOC_CTX *mem_ctx,
+                         char *target_dn,
+                         int *_num_soms,
+                         struct gp_som ***_som_list)
 {
-    char *ptr;
-    const char delim = '\\';
-    int ret;
-    int num_seps = 0;
-
-    DEBUG(SSSDBG_TRACE_ALL, "input_path: %s\n", input_path);
-
-    if (input_path == NULL ||
-        *input_path == '\0' ||
-        _converted_path == NULL) {
-        ret = EINVAL;
-        goto done;
-    }
-
-    ptr = input_path;
-    while ((ptr = strchr(ptr, delim))) {
-        if (ptr == NULL) break;
-        *ptr = '/';
-        ptr++;
-        num_seps++;
-    }
-
-    if (num_seps == 0) {
-        ret = EINVAL;
-        goto done;
-    }
-
-    *_converted_path = talloc_asprintf(mem_ctx, "smb:%s", input_path);
-    ret = EOK;
-
- done:
-    return ret;
-}
-
-
-/*
- * This function examines the gp_gplink objects in each gp_som object specified
- * in the input som_list, and populates the _candidate_gpos output parameter's
- * gpo_dn fields with prioritized list of GPO DNs. Prioritization ensures that:
- * - GPOs linked to an OU will be applied after GPOs linked to a Domain,
- *   which will be applied after GPOs linked to a Site.
- * - multiple GPOs linked to a single SOM are applied in their link order
- *   (i.e. 1st GPO linked to SOM is applied after 2nd GPO linked to SOM, etc).
- * - enforced GPOs are applied after unenforced GPOs.
- *
- * As such, the _candidate_gpos output's dn fields looks like (in link order):
- * [unenforced {Site, Domain, OU}; enforced {Site, Domain, OU}]
- *
- * Note that in the case of conflicting policy settings, GPOs appearing later
- * in the list will trump GPOs appearing earlier in the list.
- */
-static errno_t
-ad_gpo_populate_candidate_gpos(TALLOC_CTX *mem_ctx,
-                               struct gp_som **som_list,
-                               struct gp_gpo ***_candidate_gpos,
-                               int *_num_candidate_gpos)
-{
-
     TALLOC_CTX *tmp_ctx = NULL;
-    struct gp_som *gp_som = NULL;
-    struct gp_gplink *gp_gplink = NULL;
-    struct gp_gpo **candidate_gpos = NULL;
-    int num_candidate_gpos = 0;
-    char **enforced_gpo_dns = NULL;
-    char **unenforced_gpo_dns = NULL;
-    int gpo_dn_idx = 0;
-    int num_enforced = 0;
-    int enforced_idx = 0;
-    int num_unenforced = 0;
-    int unenforced_idx = 0;
-    int i = 0;
-    int j = 0;
     int ret;
+    int rdn_count = 0;
+    int som_idx = 0;
+    struct gp_som **som_list;
+    char *parent_dn = NULL;
+    char *tmp_dn = NULL;
 
     tmp_ctx = talloc_new(NULL);
     if (tmp_ctx == NULL) {
@@ -841,139 +1301,57 @@ ad_gpo_populate_candidate_gpos(TALLOC_CTX *mem_ctx,
         goto done;
     }
 
-    while (som_list[i]) {
-        gp_som = som_list[i];
-        j = 0;
-        while (gp_som->gplink_list[j]) {
-            gp_gplink = gp_som->gplink_list[j];
-            if (gp_gplink == NULL) {
-                DEBUG(SSSDBG_OP_FAILURE, "unexpected null gp_gplink\n");
-                ret = EINVAL;
-                goto done;
-            }
-            if (gp_gplink->enforced) {
-                num_enforced++;
-            } else {
-                num_unenforced++;
-            }
-            j++;
-        }
-        i++;
+    tmp_dn = target_dn;
+    while ((parent_dn = ad_gpo_parent_dn(tmp_dn))) {
+        rdn_count++;
+        tmp_dn = parent_dn;
     }
 
-    num_candidate_gpos = num_enforced + num_unenforced;
-
-    if (num_candidate_gpos == 0) {
-        *_candidate_gpos = NULL;
-        *_num_candidate_gpos = 0;
+    if (rdn_count == 0) {
+        *_som_list = NULL;
         ret = EOK;
         goto done;
     }
 
-    enforced_gpo_dns = talloc_array(tmp_ctx, char *, num_enforced + 1);
-    if (enforced_gpo_dns == NULL) {
+    /* assume the worst-case, in which every parent is a SOM */
+    /* include space for Site SOM and NULL: rdn_count + 1 + 1 */
+    som_list = talloc_array(tmp_ctx, struct gp_som *, rdn_count + 1 + 1);
+    if (som_list == NULL) {
         ret = ENOMEM;
         goto done;
     }
 
-    unenforced_gpo_dns = talloc_array(tmp_ctx, char *, num_unenforced + 1);
-    if (unenforced_gpo_dns == NULL) {
-        ret = ENOMEM;
-        goto done;
-    }
+    /* first, populate the OU and Domain SOMs */
+    tmp_dn = target_dn;
+    while ((parent_dn = ad_gpo_parent_dn(tmp_dn))) {
 
-    i = 0;
-    while (som_list[i]) {
-        gp_som = som_list[i];
-        j = 0;
-        while (gp_som->gplink_list[j]) {
-            gp_gplink = gp_som->gplink_list[j];
-            if (gp_gplink == NULL) {
-                DEBUG(SSSDBG_OP_FAILURE, "unexpected null gp_gplink\n");
-                ret = EINVAL;
+        if ((strncasecmp(parent_dn, "OU=", strlen("OU=")) == 0) ||
+            (strncasecmp(parent_dn, "DC=", strlen("DC=")) == 0)) {
+
+            som_list[som_idx] = talloc_zero(som_list, struct gp_som);
+            if (som_list[som_idx] == NULL) {
+                ret = ENOMEM;
                 goto done;
             }
-
-            if (gp_gplink->enforced) {
-                enforced_gpo_dns[enforced_idx] =
-                    talloc_strdup(enforced_gpo_dns, gp_gplink->gpo_dn);
-                if (enforced_gpo_dns[enforced_idx] == NULL) {
-                    ret = ENOMEM;
-                    goto done;
-                }
-                enforced_idx++;
-            } else {
-
-                unenforced_gpo_dns[unenforced_idx] =
-                    talloc_strdup(unenforced_gpo_dns, gp_gplink->gpo_dn);
-
-                if (unenforced_gpo_dns[unenforced_idx] == NULL) {
-                    ret = ENOMEM;
-                    goto done;
-                }
-                unenforced_idx++;
+            som_list[som_idx]->som_dn = talloc_strdup(som_list[som_idx],
+                                                      parent_dn);
+            if (som_list[som_idx]->som_dn == NULL) {
+                ret = ENOMEM;
+                goto done;
             }
-            j++;
+            som_idx++;
         }
-        i++;
-    }
-    enforced_gpo_dns[num_enforced] = NULL;
-    unenforced_gpo_dns[num_unenforced] = NULL;
 
-    candidate_gpos = talloc_array(tmp_ctx,
-                                  struct gp_gpo *,
-                                  num_candidate_gpos + 1);
-
-    if (candidate_gpos == NULL) {
-        ret = ENOMEM;
-        goto done;
+        if (strncasecmp(parent_dn, "DC=", strlen("DC=")) == 0) {
+            break;
+        }
+        tmp_dn = parent_dn;
     }
 
-    gpo_dn_idx = 0;
-    for (i = num_unenforced - 1; i >= 0; i--) {
-        candidate_gpos[gpo_dn_idx] = talloc_zero(candidate_gpos, struct gp_gpo);
-        if (candidate_gpos[gpo_dn_idx] == NULL) {
-            ret = ENOMEM;
-            goto done;
-        }
-        candidate_gpos[gpo_dn_idx]->gpo_dn =
-            talloc_strdup(candidate_gpos[gpo_dn_idx], unenforced_gpo_dns[i]);
+    som_list[som_idx] = NULL;
 
-        if (candidate_gpos[gpo_dn_idx]->gpo_dn == NULL) {
-            ret = ENOMEM;
-            goto done;
-        }
-        DEBUG(SSSDBG_TRACE_FUNC,
-              "candidate_gpos[%d]->gpo_dn: %s\n",
-              gpo_dn_idx, candidate_gpos[gpo_dn_idx]->gpo_dn);
-        gpo_dn_idx++;
-    }
-
-    for (i = 0; i < num_enforced; i++) {
-
-        candidate_gpos[gpo_dn_idx] = talloc_zero(candidate_gpos, struct gp_gpo);
-        if (candidate_gpos[gpo_dn_idx] == NULL) {
-            ret = ENOMEM;
-            goto done;
-        }
-
-        candidate_gpos[gpo_dn_idx]->gpo_dn =
-            talloc_strdup(candidate_gpos[gpo_dn_idx], enforced_gpo_dns[i]);
-        if (candidate_gpos[gpo_dn_idx]->gpo_dn == NULL) {
-            ret = ENOMEM;
-            goto done;
-        }
-
-        DEBUG(SSSDBG_TRACE_FUNC,
-              "candidate_gpos[%d]->gpo_dn: %s\n",
-              gpo_dn_idx, candidate_gpos[gpo_dn_idx]->gpo_dn);
-        gpo_dn_idx++;
-    }
-
-    candidate_gpos[gpo_dn_idx] = NULL;
-
-    *_candidate_gpos = talloc_steal(mem_ctx, candidate_gpos);
-    *_num_candidate_gpos = num_candidate_gpos;
+    *_num_soms = som_idx;
+    *_som_list = talloc_steal(mem_ctx, som_list);
 
     ret = EOK;
 
@@ -1130,820 +1508,7 @@ ad_gpo_populate_gplink_list(TALLOC_CTX *mem_ctx,
     return ret;
 }
 
-/*
- * This function populates the _som_list output parameter by parsing the input
- * DN into a list of gp_som objects. This function essentially repeatedly
- * appends the input DN's parent to the SOM List (if the parent starts with
- * "OU=" or "DC="), until the first "DC=" component is reached.
- * Example: if input DN is "CN=MyComputer,CN=Computers,OU=Sales,DC=FOO,DC=COM",
- * then SOM List has 2 SOM entries: {[OU=Sales,DC=FOO,DC=COM], [DC=FOO, DC=COM]}
- */
-
-static errno_t
-ad_gpo_populate_som_list(TALLOC_CTX *mem_ctx,
-                         char *target_dn,
-                         int *_num_soms,
-                         struct gp_som ***_som_list)
-{
-    TALLOC_CTX *tmp_ctx = NULL;
-    int ret;
-    int rdn_count = 0;
-    int som_idx = 0;
-    struct gp_som **som_list;
-    char *parent_dn = NULL;
-    char *tmp_dn = NULL;
-
-    tmp_ctx = talloc_new(NULL);
-    if (tmp_ctx == NULL) {
-        ret = ENOMEM;
-        goto done;
-    }
-
-    tmp_dn = target_dn;
-    while ((parent_dn = ad_gpo_parent_dn(tmp_dn))) {
-        rdn_count++;
-        tmp_dn = parent_dn;
-    }
-
-    if (rdn_count == 0) {
-        *_som_list = NULL;
-        ret = EOK;
-        goto done;
-    }
-
-    /* assume the worst-case, in which every parent is a SOM */
-    /* include space for Site SOM and NULL: rdn_count + 1 + 1 */
-    som_list = talloc_array(tmp_ctx, struct gp_som *, rdn_count + 1 + 1);
-    if (som_list == NULL) {
-        ret = ENOMEM;
-        goto done;
-    }
-
-    /* first, populate the OU and Domain SOMs */
-    tmp_dn = target_dn;
-    while ((parent_dn = ad_gpo_parent_dn(tmp_dn))) {
-
-        if ((strncasecmp(parent_dn, "OU=", strlen("OU=")) == 0) ||
-            (strncasecmp(parent_dn, "DC=", strlen("DC=")) == 0)) {
-
-            som_list[som_idx] = talloc_zero(som_list, struct gp_som);
-            if (som_list[som_idx] == NULL) {
-                ret = ENOMEM;
-                goto done;
-            }
-            som_list[som_idx]->som_dn = talloc_strdup(som_list[som_idx],
-                                                      parent_dn);
-            if (som_list[som_idx]->som_dn == NULL) {
-                ret = ENOMEM;
-                goto done;
-            }
-            som_idx++;
-        }
-
-        if (strncasecmp(parent_dn, "DC=", strlen("DC=")) == 0) {
-            break;
-        }
-        tmp_dn = parent_dn;
-    }
-
-    som_list[som_idx] = NULL;
-
-    *_num_soms = som_idx;
-    *_som_list = talloc_steal(mem_ctx, som_list);
-
-    ret = EOK;
-
- done:
-    talloc_free(tmp_ctx);
-    return ret;
-}
-
-struct ad_gpo_access_state {
-    struct tevent_context *ev;
-    struct sdap_id_conn_ctx *conn;
-    struct sdap_id_op *sdap_op;
-    struct sdap_options *opts;
-    int timeout;
-    struct sss_domain_info *domain;
-    char *domain_dn;
-    char *user;
-    char *ad_hostname;
-    char *target_dn;
-    struct gp_gpo **filtered_gpos;
-    int num_filtered_gpos;
-    struct gp_gpo **cse_filtered_gpos;
-    int num_cse_filtered_gpos;
-};
-
-static void ad_gpo_connect_done(struct tevent_req *subreq);
-static void ad_gpo_target_dn_retrieval_done(struct tevent_req *subreq);
-static void ad_gpo_process_som_done(struct tevent_req *subreq);
-static void ad_gpo_process_gpo_done(struct tevent_req *subreq);
-
-
-struct tevent_req *ad_gpo_process_gpo_send(TALLOC_CTX *mem_ctx,
-                                           struct tevent_context *ev,
-                                           struct sdap_id_op *sdap_op,
-                                           struct sdap_options *opts,
-                                           int timeout,
-                                           struct gp_som **som_list);
-int ad_gpo_process_gpo_recv(struct tevent_req *req,
-                            TALLOC_CTX *mem_ctx,
-                            struct gp_gpo ***candidate_gpos,
-                            int *num_candidate_gpos);
-struct tevent_req *ad_gpo_process_som_send(TALLOC_CTX *mem_ctx,
-                                           struct tevent_context *ev,
-                                           struct sdap_id_conn_ctx *conn,
-                                           struct sdap_id_op *sdap_op,
-                                           struct sdap_options *opts,
-                                           int timeout,
-                                           char *domain_name,
-                                           char *domain_dn,
-                                           char *target_dn);
-int ad_gpo_process_som_recv(struct tevent_req *req,
-                            TALLOC_CTX *mem_ctx,
-                            struct gp_som ***som_list);
-
-struct tevent_req *
-ad_gpo_access_send(TALLOC_CTX *mem_ctx,
-                   struct tevent_context *ev,
-                   struct sss_domain_info *domain,
-                   struct ad_access_ctx *ctx,
-                   char *user)
-{
-    struct tevent_req *req;
-    struct tevent_req *subreq;
-    struct ad_gpo_access_state *state;
-    errno_t ret;
-
-    req = tevent_req_create(mem_ctx, &state, struct ad_gpo_access_state);
-    if (req == NULL) {
-        DEBUG(SSSDBG_CRIT_FAILURE, "tevent_req_create() failed\n");
-        return NULL;
-    }
-
-    state->domain = domain;
-    state->filtered_gpos = NULL;
-    state->num_filtered_gpos = 0;
-    state->cse_filtered_gpos = NULL;
-    state->num_cse_filtered_gpos = 0;
-    state->ev = ev;
-    state->user = user;
-    state->ad_hostname = dp_opt_get_string(ctx->ad_options, AD_HOSTNAME);
-    state->opts = ctx->sdap_access_ctx->id_ctx->opts;
-    state->timeout = dp_opt_get_int(state->opts->basic, SDAP_SEARCH_TIMEOUT);
-    state->conn = ad_get_dom_ldap_conn(ctx->ad_id_ctx, domain);
-    state->sdap_op = sdap_id_op_create(state, state->conn->conn_cache);
-    if (state->sdap_op == NULL) {
-        DEBUG(SSSDBG_OP_FAILURE, "sdap_id_op_create failed.\n");
-        ret = ENOMEM;
-        goto immediately;
-    }
-
-    subreq = sdap_id_op_connect_send(state->sdap_op, state, &ret);
-    if (subreq == NULL) {
-        DEBUG(SSSDBG_OP_FAILURE,
-              "sdap_id_op_connect_send failed: [%d](%s)\n",
-               ret, strerror(ret));
-        goto immediately;
-    }
-    tevent_req_set_callback(subreq, ad_gpo_connect_done, req);
-
-    ret = EOK;
-
-immediately:
-
-    if (ret != EOK) {
-        tevent_req_error(req, ret);
-        tevent_req_post(req, ev);
-    }
-
-    return req;
-}
-
-static void
-ad_gpo_connect_done(struct tevent_req *subreq)
-{
-    struct tevent_req *req;
-    struct ad_gpo_access_state *state;
-    char* filter;
-
-    char *sam_account_name;
-    int dp_error;
-    errno_t ret;
-
-    const char *attrs[] = {AD_AT_DN, AD_AT_UAC, NULL};
-
-    req = tevent_req_callback_data(subreq, struct tevent_req);
-    state = tevent_req_data(req, struct ad_gpo_access_state);
-
-    ret = sdap_id_op_connect_recv(subreq, &dp_error);
-    talloc_zfree(subreq);
-
-    if (ret != EOK) {
-        /* TBD: handle (dp_error == DP_ERR_OFFLINE) case */
-
-        DEBUG(SSSDBG_OP_FAILURE,
-              "Failed to connect to AD server: [%d](%s)\n",
-               ret, strerror(ret));
-
-        tevent_req_error(req, ret);
-        return;
-    }
-
-    sam_account_name = talloc_asprintf(state, "%s$", state->ad_hostname);
-    if (sam_account_name == NULL) {
-        tevent_req_error(req, ENOMEM);
-        return;
-    }
-
-    DEBUG(SSSDBG_TRACE_FUNC, "sam_account_name is %s\n", sam_account_name);
-
-    /* Convert the domain name into domain DN */
-    ret = domain_to_basedn(state, state->domain->name, &state->domain_dn);
-    if (ret != EOK) {
-        DEBUG(SSSDBG_OP_FAILURE,
-              "Cannot convert domain name [%s] to base DN [%d]: %s\n",
-               state->domain->name, ret, strerror(ret));
-        tevent_req_error(req, ret);
-        return;
-    }
-
-    /* SDAP_OC_USER objectclass covers both users and computers */
-    filter = talloc_asprintf(state,
-                             "(&(objectclass=%s)(%s=%s))",
-                             state->opts->user_map[SDAP_OC_USER].name,
-                             state->opts->user_map[SDAP_AT_USER_NAME].name,
-                             sam_account_name);
-
-    if (filter == NULL) {
-        tevent_req_error(req, ENOMEM);
-        return;
-    }
-
-    subreq = sdap_get_generic_send(state, state->ev, state->opts,
-                                   sdap_id_op_handle(state->sdap_op),
-                                   state->domain_dn, LDAP_SCOPE_SUBTREE,
-                                   filter, attrs, NULL, 0,
-                                   state->timeout,
-                                   false);
-
-    if (subreq == NULL) {
-        DEBUG(SSSDBG_OP_FAILURE, "sdap_get_generic_send failed.\n");
-        tevent_req_error(req, EIO);
-        return;
-    }
-
-    tevent_req_set_callback(subreq, ad_gpo_target_dn_retrieval_done, req);
-}
-
-static void
-ad_gpo_target_dn_retrieval_done(struct tevent_req *subreq)
-{
-    struct tevent_req *req;
-    struct ad_gpo_access_state *state;
-    int ret;
-    int dp_error;
-    size_t reply_count;
-    struct sysdb_attrs **reply;
-    const char *target_dn = NULL;
-
-    req = tevent_req_callback_data(subreq, struct tevent_req);
-    state = tevent_req_data(req, struct ad_gpo_access_state);
-    ret = sdap_get_generic_recv(subreq, state,
-                                &reply_count, &reply);
-    talloc_zfree(subreq);
-    if (ret != EOK) {
-        ret = sdap_id_op_done(state->sdap_op, ret, &dp_error);
-        /* TBD: handle (dp_error == DP_ERR_OFFLINE) case */
-
-        DEBUG(SSSDBG_OP_FAILURE,
-              "Unable to get policy target's DN: [%d](%s)\n",
-               ret, strerror(ret));
-        ret = ENOENT;
-        goto done;
-    }
-
-    /* make sure there is only one non-NULL reply returned */
-
-    if (reply_count < 1) {
-        DEBUG(SSSDBG_OP_FAILURE, "No DN retrieved for policy target.\n");
-        ret = ENOENT;
-        goto done;
-    } else if (reply_count > 1) {
-        DEBUG(SSSDBG_OP_FAILURE, "Multiple replies for policy target\n");
-        ret = ERR_INTERNAL;
-        goto done;
-    } else if (reply == NULL) {
-        DEBUG(SSSDBG_OP_FAILURE, "reply_count is 1, but reply is NULL\n");
-        ret = ERR_INTERNAL;
-        goto done;
-    }
-
-    /* reply[0] holds requested attributes of single reply */
-    ret = sysdb_attrs_get_string(reply[0], AD_AT_DN, &target_dn);
-    if (ret != EOK) {
-        DEBUG(SSSDBG_OP_FAILURE,
-              "sysdb_attrs_get_string failed: [%d](%s)\n",
-               ret, strerror(ret));
-        goto done;
-    }
-
-    state->target_dn = talloc_strdup(state, target_dn);
-    if (state->target_dn == NULL) {
-        ret = ENOMEM;
-        goto done;
-    }
-
-    uint32_t uac;
-    ret = sysdb_attrs_get_uint32_t(reply[0], AD_AT_UAC, &uac);
-    if (ret != EOK) {
-        DEBUG(SSSDBG_OP_FAILURE,
-              "sysdb_attrs_get_uint32_t failed: [%d](%s)\n",
-               ret, strerror(ret));
-        goto done;
-    }
-
-    /* we only support computer policy targets, not users */
-    if (!(uac & UAC_WORKSTATION_TRUST_ACCOUNT)) {
-        ret = EINVAL;
-        goto done;
-    }
-
-    state->target_dn = talloc_strdup(state, target_dn);
-    if (state->target_dn == NULL) {
-        ret = ENOMEM;
-        goto done;
-    }
-
-    subreq = ad_gpo_process_som_send(state,
-                                     state->ev,
-                                     state->conn,
-                                     state->sdap_op,
-                                     state->opts,
-                                     state->timeout,
-                                     state->domain->name,
-                                     state->domain_dn,
-                                     state->target_dn);
-    if (subreq == NULL) {
-        ret = ENOMEM;
-        goto done;
-    }
-
-    tevent_req_set_callback(subreq, ad_gpo_process_som_done, req);
-
- done:
-
-    if (ret != EOK) {
-        tevent_req_error(req, ret);
-    }
-}
-
-static void
-ad_gpo_process_som_done(struct tevent_req *subreq)
-{
-    struct tevent_req *req;
-    struct ad_gpo_access_state *state;
-    int ret;
-    struct gp_som **som_list;
-
-    req = tevent_req_callback_data(subreq, struct tevent_req);
-    state = tevent_req_data(req, struct ad_gpo_access_state);
-    ret = ad_gpo_process_som_recv(subreq, state, &som_list);
-    talloc_zfree(subreq);
-
-    if (ret != EOK) {
-        DEBUG(SSSDBG_OP_FAILURE,
-              "Unable to get som list: [%d](%s)\n",
-               ret, strerror(ret));
-        ret = ENOENT;
-        goto done;
-    }
-
-    subreq = ad_gpo_process_gpo_send(state,
-                                     state->ev,
-                                     state->sdap_op,
-                                     state->opts,
-                                     state->timeout,
-                                     som_list);
-    if (subreq == NULL) {
-        ret = ENOMEM;
-        goto done;
-    }
-
-    tevent_req_set_callback(subreq, ad_gpo_process_gpo_done, req);
-
- done:
-
-    if (ret != EOK) {
-        tevent_req_error(req, ret);
-    }
-}
-
-static errno_t
-parse_logon_right_with_libini(struct ini_cfgobj *ini_config,
-                              const char *section,
-                              const char *name,
-                              int *_size,
-                              char ***_sids)
-{
-  int ret = 0;
-  struct value_obj *vobj = NULL;
-  char **sids = NULL;
-  int numSids;
-  int i;
-
-  ret = ini_get_config_valueobj(section, name, ini_config, INI_GET_FIRST_VALUE,
-                                &vobj);
-  if (vobj == NULL) {
-      DEBUG(SSSDBG_CRIT_FAILURE, "section/name not found: [%s][%s]\n",
-            section, name);
-      return EOK;
-  }
-  sids = ini_get_string_config_array(vobj, NULL, &numSids, &ret);
-
-  if (ret) {
-      DEBUG(SSSDBG_CRIT_FAILURE,
-            "ini_get_string_config_array failed [%d][%s]\n", ret, strerror(ret));
-      return ret;
-  }
-
-  for (i = 0; i <numSids; i++) {
-    if (sids[i][0] == '*') {
-      sids[i]++;
-    }
-  }
-
-  *_size = numSids;
-  *_sids = sids;
-  return EOK;
-}
-
-static errno_t
-ad_gpo_parse_gpt_tmpl_file(TALLOC_CTX *mem_ctx,
-                           uint8_t *data_buf,
-                           int data_len,
-                           char ***allowed_sids,
-                           int *allowed_size,
-                           char ***denied_sids,
-                           int *denied_size)
-{
-    struct ini_cfgfile *file_ctx = NULL;
-    struct ini_cfgobj *ini_config = NULL;
-    int ret;
-    char **allow_sids = NULL; char **deny_sids = NULL;
-    int allow_size = 0; int deny_size = 0;
-
-    ret = ini_config_create(&ini_config);
-    if (ret) goto done;
-    ret = ini_config_file_from_mem(data_buf, data_len, &file_ctx);
-    if (ret) goto done;
-    ret = ini_config_parse(file_ctx, INI_STOP_ON_NONE, 0, 0, ini_config);
-    if (ret) goto done;
-    ret = parse_logon_right_with_libini(ini_config,
-                                        RIGHTS_SECTION,
-                                        ALLOW_LOGON_LOCALLY,
-                                        &allow_size,
-                                        &allow_sids);
-    if (ret) {goto done;}
-
-    ret = parse_logon_right_with_libini(ini_config,
-                                        RIGHTS_SECTION,
-                                        DENY_LOGON_LOCALLY,
-                                        &deny_size,
-                                        &deny_sids);
-    if (ret) {goto done;}
-
-    *allowed_sids = allow_sids;
-    *allowed_size = allow_size;
-    *denied_sids = deny_sids;
-    *denied_size = deny_size;
-
- done:
-
-    if (ret) {
-      DEBUG(SSSDBG_CRIT_FAILURE, "Error encountered: %d.\n", ret);
-    }
-
-    ini_config_file_close(file_ctx);
-    return ret;
-}
-
-static void
-sssd_krb_get_auth_data_fn(const char * pServer,
-                     const char * pShare,
-                     char * pWorkgroup,
-                     int maxLenWorkgroup,
-                     char * pUsername,
-                     int maxLenUsername,
-                     char * pPassword,
-                     int maxLenPassword)
-{
-    /* since we are using kerberos for authentication, we simply return */
-    return;
-}
-
-// principal input: usersid, groupsids
-// gpt_templ input: allowed users, allowed groups, denied users, denied groups
-static void
-check_rights(char **right_sids,
-             int right_size,
-             const char *user_sid,
-             const char **group_sids,
-             int group_size,
-             int *found)
-{
-  int match = 0;
-  int i, j;
-
-  for (i = 0; i < right_size; i++) {
-    if (strcmp(user_sid, right_sids[i]) == 0) {
-      match = 1;
-      break;
-    }
-    for (j = 0; j < group_size; j++) {
-      if (strcmp(group_sids[j], right_sids[i]) == 0) {
-	match = 1;
-	break;
-      }
-    }
-  }
-
-  *found = match;
-}
-
-//
-// denied_user         => S-1-5-21-1175337206-4250576914-2321192831-1142
-// allowed_denied_user => S-1-5-21-1175337206-4250576914-2321192831-1144
-// allowed_user        => S-1-5-21-1175337206-4250576914-2321192831-1103
-// Administrator       => S-1-5-21-1175337206-4250576914-2321192831-500
-//
-// {5ABFCFCB-51B5-4727-B794-86BF28FFDC96}: "deny_denied_user"
-// denied_sids: -1142 (denied_user)
-//   [Privilege Rights]
-//   SeDenyInteractiveLogonRight = *S-1-5-21-...2321192831-1142
-//
-// {66B30995-41DB-45B9-A42B-44E0A68765BB}: "allow_denied_user"
-// allowed_sids: -1142, -544 (denied_user, Administrators group)
-//   [Privilege Rights]
-//   SeInteractiveLogonRight = *S-1-5-21-...2321192831-1142,*S-1-5-32-544
-//
-//
-
-static errno_t
-ad_gpo_access_check(TALLOC_CTX *mem_ctx,
-                    char *user,
-                    struct sss_domain_info *domain,
-                    uint8_t *data_buf,
-                    int data_len)
-{
-    char **allowed_sids;
-    char **denied_sids;
-    int allowed_size = 0;
-    int denied_size = 0;
-    const char *user_sid;
-    const char **group_sids;
-    int group_size = 0;
-    int access_granted = 0;
-    int access_denied = 0;
-    int ret;
-    int j;
-
-    ret = ad_gpo_parse_gpt_tmpl_file(mem_ctx,
-                                     data_buf,
-                                     data_len,
-                                     &allowed_sids,
-                                     &allowed_size,
-                                     &denied_sids,
-                                     &denied_size);
-    if (ret) goto done;
-
-    DEBUG(1, "POLICY FILE:\n");
-    DEBUG(1, "allowed_size = %d\n", allowed_size);
-    for (j= 0; j < allowed_size; j++) {
-        DEBUG(SSSDBG_CRIT_FAILURE, "allowed_sids[%d] = %s\n", j,
-              allowed_sids[j]);
-    }
-
-    DEBUG(1, "denied_size = %d\n", denied_size);
-    for (j= 0; j < denied_size; j++) {
-        DEBUG(SSSDBG_CRIT_FAILURE, " denied_sids[%d] = %s\n", j,
-              denied_sids[j]);
-    }
-
-    ret = ad_gpo_get_sids(mem_ctx, user, domain, &user_sid,
-                          &group_sids, &group_size);
-    if (ret) goto done;
-
-    DEBUG(1, "CURRENT USER:\n");
-    DEBUG(1, "       user_sid = %s\n", user_sid);
-
-    for (j= 0; j < group_size; j++) {
-        DEBUG(SSSDBG_CRIT_FAILURE, "  group_sids[%d] = %s\n", j,
-              group_sids[j]);
-    }
-
-    /* If AllowLogonLocally is not defined, all users are allowed */
-    if (allowed_size == 0) {
-      access_granted = 1;
-    }  else {
-      check_rights(allowed_sids, allowed_size, user_sid,
-                   group_sids, group_size, &access_granted);
-    }
-
-    DEBUG(1, " access_granted = %d\n", access_granted);
-
-    check_rights(denied_sids, denied_size, user_sid,
-                 group_sids, group_size, &access_denied);
-    DEBUG(1, "  access_denied = %d\n", access_denied);
-
-    if (access_granted && !access_denied) {
-        return EOK;
-    } else {
-        return EACCES;
-    }
-
- done:
-
-    if (ret) {
-        DEBUG(SSSDBG_CRIT_FAILURE, "Error encountered: %d.\n", ret);
-    }
-
-    return ret;
-}
-
-static errno_t
-process_security_settings_cse(TALLOC_CTX *mem_ctx,
-                              const char *smb_path,
-                              char *user,
-                              struct sss_domain_info *domain)
-{
-    SMBCCTX *context;
-    int ret = 0;
-    uint8_t buf[SMB_BUFFER_SIZE];
-
-    DEBUG(SSSDBG_CRIT_FAILURE, "%s\n", smb_path);
-
-    context = smbc_new_context();
-    if (!context) {
-        DEBUG(SSSDBG_CRIT_FAILURE, "Could not allocate new smbc context\n");
-    }
-
-    smbc_setFunctionAuthData(context, sssd_krb_get_auth_data_fn);
-    smbc_setOptionUseKerberos(context, 1);
-    /* TBD: figure out whether we need the following function call */
-    /* smbc_setOptionFallbackAfterKerberos(context, 1); */
-
-    /* Initialize the context using the previously specified options */
-    if (!smbc_init_context(context)) {
-        smbc_free_context(context, 0);
-        DEBUG(SSSDBG_CRIT_FAILURE, "Could not initialize smbc context\n");
-    }
-
-    /* Tell the compatibility layer to use this context */
-    smbc_set_context(context);
-
-    int remotehandle = smbc_open(smb_path, O_RDONLY, 0755);
-    if (remotehandle < 0) DEBUG(SSSDBG_CRIT_FAILURE, "smbc_open failed\n");
-
-    int bytesread = smbc_read(remotehandle, buf, sizeof(buf));
-    if(bytesread < 0) DEBUG(SSSDBG_CRIT_FAILURE, "smbc_read failed\n");
-
-    DEBUG(SSSDBG_CRIT_FAILURE, "bytesread: %d\n", bytesread);
-
-    smbc_close(remotehandle);
-
-    ret = ad_gpo_access_check(mem_ctx,
-                              user,
-                              domain,
-                              buf,
-                              bytesread);
-
-    return ret;
-}
-
-static void
-ad_gpo_process_gpo_done(struct tevent_req *subreq)
-{
-    struct tevent_req *req;
-    struct ad_gpo_access_state *state;
-    int ret;
-    int dp_error;
-    struct gp_gpo **candidate_gpos = NULL;
-    int num_candidate_gpos = 0;
-    int i = 0;
-    int j = 0;
-    char *full_smb_uri;
-
-    req = tevent_req_callback_data(subreq, struct tevent_req);
-    state = tevent_req_data(req, struct ad_gpo_access_state);
-    ret = ad_gpo_process_gpo_recv(subreq, state, &candidate_gpos,
-                                  &num_candidate_gpos);
-
-    talloc_zfree(subreq);
-
-    ret = sdap_id_op_done(state->sdap_op, ret, &dp_error);
-
-    if (ret != EOK) {
-        /* TBD: handle (dp_error == DP_ERR_OFFLINE) case */
-
-        DEBUG(SSSDBG_OP_FAILURE,
-              "Unable to get GPO list: [%d](%s)\n",
-              ret, strerror(ret));
-        ret = ENOENT;
-        goto done;
-    }
-
-    ret = ad_gpo_filter_gpos_by_dacl(state, state->user, state->domain,
-                                     candidate_gpos, num_candidate_gpos,
-                                     &state->filtered_gpos,
-                                     &state->num_filtered_gpos);
-    if (ret != EOK) {
-        DEBUG(SSSDBG_OP_FAILURE,
-              "Unable to filter GPO list: [%d](%s)\n",
-              ret, strerror(ret));
-        goto done;
-    }
-
-    if (state->filtered_gpos[0] == NULL) {
-        DEBUG(SSSDBG_TRACE_FUNC, "filtered_gpos is empty\n");
-    }
-
-    for (i = 0; i < state->num_filtered_gpos; i++) {
-        DEBUG(SSSDBG_TRACE_FUNC, "dacl filtered_gpos[%d]->gpo_guid is %s\n", i,
-              state->filtered_gpos[i]->gpo_guid);
-    }
-
-
-    ret = ad_gpo_filter_gpos_by_cse_guid(state,
-                                         GP_EXT_GUID_SECURITY,
-                                         state->filtered_gpos,
-                                         state->num_filtered_gpos,
-                                         &state->cse_filtered_gpos,
-                                         &state->num_cse_filtered_gpos);
-
-    if (ret != EOK) {
-        DEBUG(SSSDBG_OP_FAILURE,
-              "Unable to filter GPO list by CSE_GUID: [%d](%s)\n",
-               ret, strerror(ret));
-        goto done;
-    }
-
-    for (i = 0; i < state->num_cse_filtered_gpos; i++) {
-        DEBUG(SSSDBG_TRACE_FUNC, "cse_filtered_gpos[%d]->gpo_guid is %s\n", i,
-                                  state->cse_filtered_gpos[i]->gpo_guid);
-    }
-
-    DEBUG(SSSDBG_TRACE_FUNC, "time for SMB retrieval\n");
-
-    DEBUG(SSSDBG_TRACE_FUNC, "num_cse_filtered_gpos: %d\n",
-          state->num_cse_filtered_gpos);
-    for (i = 0; i < state->num_cse_filtered_gpos; i++) {
-        struct gp_gpo *cse_filtered_gpo = state->cse_filtered_gpos[i];
-        DEBUG(SSSDBG_TRACE_FUNC, "cse filtered_gpos[%d]->gpo_guid is %s\n", i,
-              cse_filtered_gpo->gpo_guid);
-        DEBUG(SSSDBG_TRACE_ALL, "cse filtered_gpos[%d]->file_sys_path is %s\n",
-              i, cse_filtered_gpo->gpo_file_sys_path);
-        for (j = 0; j < cse_filtered_gpo->num_gpo_cse_guids; j++) {
-            DEBUG(SSSDBG_TRACE_ALL,
-                  "cse_filtered_gpos[%d]->gpo_cse_guids[%d]->gpo_guid is %s\n",
-                  i, j, cse_filtered_gpo->gpo_cse_guids[j]);
-        }
-
-        full_smb_uri = talloc_asprintf(state, "%s%s",
-                                       cse_filtered_gpo->gpo_file_sys_path,
-                                       GP_EXT_GUID_SECURITY_SUFFIX);
-
-        ret = process_security_settings_cse(state, full_smb_uri, state->user,
-                                            state->domain);
-
-        if (ret == EOK) {
-            DEBUG(1, "ret is EOK\n");
-        } else {
-            DEBUG(1, "ret is not EOK\n");
-            DEBUG(SSSDBG_OP_FAILURE,
-                  "GPO check failed: [%d](%s)\n",
-                   ret, strerror(ret));
-            goto done;
-        }
-    }
-
- done:
-
-    if (ret == EOK) {
-        tevent_req_done(req);
-    } else {
-        tevent_req_error(req, ret);
-    }
-}
-
-errno_t
-ad_gpo_access_recv(struct tevent_req *req)
-{
-    TEVENT_REQ_RETURN_ON_ERROR(req);
-
-    return EOK;
-}
+/* == ad_gpo_process_som_send/recv implementation ========================== */
 
 struct ad_gpo_process_som_state {
     struct tevent_context *ev;
@@ -1953,7 +1518,6 @@ struct ad_gpo_process_som_state {
     bool allow_enforced_only;
     char *site_name;
     char *site_dn;
-    char *domain_dn;
     struct gp_som **som_list;
     int som_index;
     int num_soms;
@@ -1964,6 +1528,19 @@ static void ad_gpo_site_dn_retrieval_done(struct tevent_req *subreq);
 static errno_t ad_gpo_get_som_attrs_step(struct tevent_req *req);
 static void ad_gpo_get_som_attrs_done(struct tevent_req *subreq);
 
+
+/*
+ * This function uses the input target_dn and input domain_name to populate
+ * a list of gp_som objects. Each object in this list represents a SOM
+ * associated with the target (such as OU, Domain, and Site).
+ *
+ * The inputs are used to determine the DNs of each SOM associated with the
+ * target. In turn, the SOM object DNs are used to retrieve certain LDAP
+ * attributes of each SOM object, that are parsed into an array of gp_gplink
+ * objects, essentially representing the GPOs that have been linked to each
+ * SOM object. Note that it is perfectly valid for there to be *no* GPOs
+ * linked to a SOM object.
+ */
 struct tevent_req *
 ad_gpo_process_som_send(TALLOC_CTX *mem_ctx,
                         struct tevent_context *ev,
@@ -1971,9 +1548,8 @@ ad_gpo_process_som_send(TALLOC_CTX *mem_ctx,
                         struct sdap_id_op *sdap_op,
                         struct sdap_options *opts,
                         int timeout,
-                        char *domain_name,
-                        char *domain_dn,
-                        char *target_dn)
+                        char *target_dn,
+                        char *domain_name)
 {
     struct tevent_req *req;
     struct tevent_req *subreq;
@@ -1990,7 +1566,6 @@ ad_gpo_process_som_send(TALLOC_CTX *mem_ctx,
     state->sdap_op = sdap_op;
     state->opts = opts;
     state->timeout = timeout;
-    state->domain_dn = domain_dn;
     state->som_index = -1;
     state->allow_enforced_only = 0;
 
@@ -2326,6 +1901,373 @@ ad_gpo_process_som_recv(struct tevent_req *req,
     return EOK;
 }
 
+/* == ad_gpo_process_gpo_send/recv helpers ================================= */
+
+/*
+ * This function examines the gp_gplink objects in each gp_som object specified
+ * in the input som_list, and populates the _candidate_gpos output parameter's
+ * gpo_dn fields with prioritized list of GPO DNs. Prioritization ensures that:
+ * - GPOs linked to an OU will be applied after GPOs linked to a Domain,
+ *   which will be applied after GPOs linked to a Site.
+ * - multiple GPOs linked to a single SOM are applied in their link order
+ *   (i.e. 1st GPO linked to SOM is applied after 2nd GPO linked to SOM, etc).
+ * - enforced GPOs are applied after unenforced GPOs.
+ *
+ * As such, the _candidate_gpos output's dn fields looks like (in link order):
+ * [unenforced {Site, Domain, OU}; enforced {Site, Domain, OU}]
+ *
+ * Note that in the case of conflicting policy settings, GPOs appearing later
+ * in the list will trump GPOs appearing earlier in the list.
+ */
+static errno_t
+ad_gpo_populate_candidate_gpos(TALLOC_CTX *mem_ctx,
+                               struct gp_som **som_list,
+                               struct gp_gpo ***_candidate_gpos,
+                               int *_num_candidate_gpos)
+{
+
+    TALLOC_CTX *tmp_ctx = NULL;
+    struct gp_som *gp_som = NULL;
+    struct gp_gplink *gp_gplink = NULL;
+    struct gp_gpo **candidate_gpos = NULL;
+    int num_candidate_gpos = 0;
+    char **enforced_gpo_dns = NULL;
+    char **unenforced_gpo_dns = NULL;
+    int gpo_dn_idx = 0;
+    int num_enforced = 0;
+    int enforced_idx = 0;
+    int num_unenforced = 0;
+    int unenforced_idx = 0;
+    int i = 0;
+    int j = 0;
+    int ret;
+
+    tmp_ctx = talloc_new(NULL);
+    if (tmp_ctx == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+
+    while (som_list[i]) {
+        gp_som = som_list[i];
+        j = 0;
+        while (gp_som->gplink_list[j]) {
+            gp_gplink = gp_som->gplink_list[j];
+            if (gp_gplink == NULL) {
+                DEBUG(SSSDBG_OP_FAILURE, "unexpected null gp_gplink\n");
+                ret = EINVAL;
+                goto done;
+            }
+            if (gp_gplink->enforced) {
+                num_enforced++;
+            } else {
+                num_unenforced++;
+            }
+            j++;
+        }
+        i++;
+    }
+
+    num_candidate_gpos = num_enforced + num_unenforced;
+
+    if (num_candidate_gpos == 0) {
+        *_candidate_gpos = NULL;
+        *_num_candidate_gpos = 0;
+        ret = EOK;
+        goto done;
+    }
+
+    enforced_gpo_dns = talloc_array(tmp_ctx, char *, num_enforced + 1);
+    if (enforced_gpo_dns == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+
+    unenforced_gpo_dns = talloc_array(tmp_ctx, char *, num_unenforced + 1);
+    if (unenforced_gpo_dns == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+
+    i = 0;
+    while (som_list[i]) {
+        gp_som = som_list[i];
+        j = 0;
+        while (gp_som->gplink_list[j]) {
+            gp_gplink = gp_som->gplink_list[j];
+            if (gp_gplink == NULL) {
+                DEBUG(SSSDBG_OP_FAILURE, "unexpected null gp_gplink\n");
+                ret = EINVAL;
+                goto done;
+            }
+
+            if (gp_gplink->enforced) {
+                enforced_gpo_dns[enforced_idx] =
+                    talloc_strdup(enforced_gpo_dns, gp_gplink->gpo_dn);
+                if (enforced_gpo_dns[enforced_idx] == NULL) {
+                    ret = ENOMEM;
+                    goto done;
+                }
+                enforced_idx++;
+            } else {
+
+                unenforced_gpo_dns[unenforced_idx] =
+                    talloc_strdup(unenforced_gpo_dns, gp_gplink->gpo_dn);
+
+                if (unenforced_gpo_dns[unenforced_idx] == NULL) {
+                    ret = ENOMEM;
+                    goto done;
+                }
+                unenforced_idx++;
+            }
+            j++;
+        }
+        i++;
+    }
+    enforced_gpo_dns[num_enforced] = NULL;
+    unenforced_gpo_dns[num_unenforced] = NULL;
+
+    candidate_gpos = talloc_array(tmp_ctx,
+                                  struct gp_gpo *,
+                                  num_candidate_gpos + 1);
+
+    if (candidate_gpos == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+
+    gpo_dn_idx = 0;
+    for (i = num_unenforced - 1; i >= 0; i--) {
+        candidate_gpos[gpo_dn_idx] = talloc_zero(candidate_gpos, struct gp_gpo);
+        if (candidate_gpos[gpo_dn_idx] == NULL) {
+            ret = ENOMEM;
+            goto done;
+        }
+        candidate_gpos[gpo_dn_idx]->gpo_dn =
+            talloc_strdup(candidate_gpos[gpo_dn_idx], unenforced_gpo_dns[i]);
+
+        if (candidate_gpos[gpo_dn_idx]->gpo_dn == NULL) {
+            ret = ENOMEM;
+            goto done;
+        }
+        DEBUG(SSSDBG_TRACE_FUNC,
+              "candidate_gpos[%d]->gpo_dn: %s\n",
+              gpo_dn_idx, candidate_gpos[gpo_dn_idx]->gpo_dn);
+        gpo_dn_idx++;
+    }
+
+    for (i = 0; i < num_enforced; i++) {
+
+        candidate_gpos[gpo_dn_idx] = talloc_zero(candidate_gpos, struct gp_gpo);
+        if (candidate_gpos[gpo_dn_idx] == NULL) {
+            ret = ENOMEM;
+            goto done;
+        }
+
+        candidate_gpos[gpo_dn_idx]->gpo_dn =
+            talloc_strdup(candidate_gpos[gpo_dn_idx], enforced_gpo_dns[i]);
+        if (candidate_gpos[gpo_dn_idx]->gpo_dn == NULL) {
+            ret = ENOMEM;
+            goto done;
+        }
+
+        DEBUG(SSSDBG_TRACE_FUNC,
+              "candidate_gpos[%d]->gpo_dn: %s\n",
+              gpo_dn_idx, candidate_gpos[gpo_dn_idx]->gpo_dn);
+        gpo_dn_idx++;
+    }
+
+    candidate_gpos[gpo_dn_idx] = NULL;
+
+    *_candidate_gpos = talloc_steal(mem_ctx, candidate_gpos);
+    *_num_candidate_gpos = num_candidate_gpos;
+
+    ret = EOK;
+
+ done:
+    talloc_free(tmp_ctx);
+    return ret;
+}
+
+/*
+ * This function populates the _cse_guid_list output parameter by parsing the
+ * input raw_machine_ext_names_value into an array of cse_guid strings.
+ *
+ * The raw_machine_ext_names_value is a single string in the following format:
+ * "[{cse_guid_1}{tool_guid1}]...[{cse_guid_n}{tool_guid_n}]"
+ */
+static errno_t
+ad_gpo_convert_to_smb_uri(TALLOC_CTX *mem_ctx,
+                          char *input_path,
+                          char **_converted_path)
+{
+    char *ptr;
+    const char delim = '\\';
+    int ret;
+    int num_seps = 0;
+
+    DEBUG(SSSDBG_TRACE_ALL, "input_path: %s\n", input_path);
+
+    if (input_path == NULL ||
+        *input_path == '\0' ||
+        _converted_path == NULL) {
+        ret = EINVAL;
+        goto done;
+    }
+
+    ptr = input_path;
+    while ((ptr = strchr(ptr, delim))) {
+        if (ptr == NULL) break;
+        *ptr = '/';
+        ptr++;
+        num_seps++;
+    }
+
+    if (num_seps == 0) {
+        ret = EINVAL;
+        goto done;
+    }
+
+    *_converted_path = talloc_asprintf(mem_ctx, "smb:%s", input_path);
+    ret = EOK;
+
+ done:
+    return ret;
+}
+
+/*
+ * This function populates the _cse_guid_list output parameter by parsing the
+ * input raw_machine_ext_names_value into an array of cse_guid strings.
+ *
+ * The raw_machine_ext_names_value is a single string in the following format:
+ * "[{cse_guid_1}{tool_guid1}]...[{cse_guid_n}{tool_guid_n}]"
+ */
+static errno_t
+ad_gpo_parse_machine_ext_names(TALLOC_CTX *mem_ctx,
+                               char *raw_machine_ext_names_value,
+                               char ***_gpo_cse_guids,
+                               int *_num_gpo_cse_guids)
+{
+    TALLOC_CTX *tmp_ctx = NULL;
+    char *ptr;
+    char *first;
+    char *last;
+    char *cse_guid;
+    char *tool_guid;
+    const char delim = ']';
+    char **gpo_cse_guids;
+    int i;
+    int ret;
+    int num_gpo_cse_guids = 0;
+
+    if (raw_machine_ext_names_value == NULL ||
+        *raw_machine_ext_names_value == '\0' ||
+        _gpo_cse_guids == NULL) {
+        return EINVAL;
+    }
+
+    tmp_ctx = talloc_new(NULL);
+    if (tmp_ctx == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+
+    ptr = raw_machine_ext_names_value;
+    if (ptr == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+
+    while ((ptr = strchr(ptr, delim))) {
+        if (ptr == NULL) break;
+        ptr++;
+        num_gpo_cse_guids++;
+    }
+
+    if (num_gpo_cse_guids == 0) {
+        ret = EINVAL;
+        goto done;
+    }
+
+    gpo_cse_guids = talloc_array(tmp_ctx, char *, num_gpo_cse_guids + 1);
+    if (gpo_cse_guids == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
+
+    ptr = raw_machine_ext_names_value;
+    for (i = 0; i < num_gpo_cse_guids; i++) {
+        first = ptr + 1;
+        last = strchr(first, delim);
+        if (last == NULL) {
+            break;
+        }
+        *last = '\0';
+        last++;
+        cse_guid = first;
+        first ++;
+        tool_guid = strchr(first, '{');
+        if (tool_guid == NULL) {
+            break;
+        }
+        *tool_guid = '\0';
+        gpo_cse_guids[i] = talloc_strdup(gpo_cse_guids, cse_guid);
+        ptr = last;
+    }
+    gpo_cse_guids[i] = NULL;
+
+    DEBUG(SSSDBG_TRACE_ALL, "num_gpo_cse_guids: %d\n", num_gpo_cse_guids);
+
+    for (i = 0; i < num_gpo_cse_guids; i++) {
+        DEBUG(SSSDBG_TRACE_ALL,
+              "gpo_cse_guids[%d] is %s\n", i, gpo_cse_guids[i]);
+    }
+
+    *_gpo_cse_guids = talloc_steal(mem_ctx, gpo_cse_guids);
+    *_num_gpo_cse_guids = num_gpo_cse_guids;
+    ret = EOK;
+
+ done:
+    talloc_free(tmp_ctx);
+    return ret;
+}
+
+enum ndr_err_code
+ndr_pull_security_descriptor(struct ndr_pull *ndr, int ndr_flags,
+                             struct security_descriptor *r);
+
+/*
+ * This function parses the input data blob and assigns the resulting
+ * security_descriptor object to the _gpo_sd output parameter.
+ */
+static errno_t ad_gpo_parse_sd(TALLOC_CTX *mem_ctx,
+                               uint8_t *data,
+                               size_t length,
+                               struct security_descriptor **_gpo_sd)
+{
+
+    struct ndr_pull *ndr_pull = NULL;
+    struct security_descriptor sd;
+    DATA_BLOB blob;
+
+    blob.data = data;
+    blob.length = length;
+
+    ndr_pull = ndr_pull_init_blob(&blob, mem_ctx);
+    if (ndr_pull == NULL) {
+        DEBUG(SSSDBG_OP_FAILURE, "ndr_pull_init_blob() failed.\n");
+        return EINVAL;
+    }
+
+    ndr_pull_security_descriptor(ndr_pull, NDR_SCALARS|NDR_BUFFERS, &sd);
+
+    *_gpo_sd = talloc_memdup(mem_ctx, &sd, sizeof(struct security_descriptor));
+
+    return EOK;
+}
+
+/* == ad_gpo_process_gpo_send/recv implementation ========================== */
+
 struct ad_gpo_process_gpo_state {
     struct tevent_context *ev;
     struct sdap_id_op *sdap_op;
@@ -2339,7 +2281,15 @@ struct ad_gpo_process_gpo_state {
 static errno_t ad_gpo_get_gpo_attrs_step(struct tevent_req *req);
 static void ad_gpo_get_gpo_attrs_done(struct tevent_req *subreq);
 
-
+/*
+ * This function uses the input som_list to populate a prioritized list of
+ * gp_gpo objects, prioritized based on SOM type, link order, and whether the
+ * GPO is "enforced". This list represents the initial set of candidate GPOs
+ * that might be applicable to the target. This list can not be expanded, but
+ * it might be reduced based on subsequent filtering steps. The GPO object DNs
+ * are used to retrieve certain LDAP attributes of each GPO object, that are
+ * parsed into the various fields of the gp_gpo object.
+ */
 struct tevent_req *
 ad_gpo_process_gpo_send(TALLOC_CTX *mem_ctx,
                         struct tevent_context *ev,
@@ -2526,7 +2476,8 @@ ad_gpo_get_gpo_attrs_done(struct tevent_req *subreq)
         goto done;
     }
 
-    ad_gpo_convert_to_smb_uri(state, raw_file_sys_path, &smb_uri);
+    char *file_sys_path = talloc_strdup(gp_gpo, raw_file_sys_path);
+    ad_gpo_convert_to_smb_uri(state, file_sys_path, &smb_uri);
 
     gp_gpo->gpo_file_sys_path = talloc_asprintf(gp_gpo, "%s/Machine",
                                                 smb_uri);
@@ -2643,3 +2594,344 @@ ad_gpo_process_gpo_recv(struct tevent_req *req,
     *num_candidate_gpos = state->num_candidate_gpos;
     return EOK;
 }
+
+/* == ad_gpo_process_cse_send/recv helpers ================================= */
+
+static errno_t
+parse_logon_right_with_libini(struct ini_cfgobj *ini_config,
+                              const char *section,
+                              const char *name,
+                              int *_size,
+                              char ***_sids)
+{
+  int ret = 0;
+  struct value_obj *vobj = NULL;
+  char **sids = NULL;
+  int num_sids;
+  int i;
+
+  ret = ini_get_config_valueobj(section, name, ini_config, INI_GET_FIRST_VALUE,
+                                &vobj);
+  if (vobj == NULL) {
+      DEBUG(SSSDBG_CRIT_FAILURE, "section/name not found: [%s][%s]\n",
+            section, name);
+      return EOK;
+  }
+  sids = ini_get_string_config_array(vobj, NULL, &num_sids, &ret);
+
+  if (ret) {
+      DEBUG(SSSDBG_CRIT_FAILURE,
+            "ini_get_string_config_array failed [%d][%s]\n", ret, strerror(ret));
+      return ret;
+  }
+
+  for (i = 0; i <num_sids; i++) {
+    if (sids[i][0] == '*') {
+      sids[i]++;
+    }
+  }
+
+  *_size = num_sids;
+  *_sids = sids;
+
+  return EOK;
+}
+
+static errno_t
+ad_gpo_parse_security_cse_buffer(uint8_t *data_buf,
+                                 int data_len,
+                                 char ***allowed_sids,
+                                 int *allowed_size,
+                                 char ***denied_sids,
+                                 int *denied_size)
+{
+    struct ini_cfgfile *file_ctx = NULL;
+    struct ini_cfgobj *ini_config = NULL;
+    int ret;
+    char **allow_sids = NULL; char **deny_sids = NULL;
+    int allow_size = 0; int deny_size = 0;
+
+    ret = ini_config_create(&ini_config);
+    if (ret) goto done;
+    ret = ini_config_file_from_mem(data_buf, data_len, &file_ctx);
+    if (ret) goto done;
+    ret = ini_config_parse(file_ctx, INI_STOP_ON_NONE, 0, 0, ini_config);
+    if (ret) goto done;
+
+    ret = parse_logon_right_with_libini(ini_config,
+                                        RIGHTS_SECTION,
+                                        ALLOW_LOGON_LOCALLY,
+                                        &allow_size,
+                                        &allow_sids);
+    if (ret) {goto done;}
+
+    ret = parse_logon_right_with_libini(ini_config,
+                                        RIGHTS_SECTION,
+                                        DENY_LOGON_LOCALLY,
+                                        &deny_size,
+                                        &deny_sids);
+    if (ret) {goto done;}
+
+    *allowed_sids = allow_sids;
+    *allowed_size = allow_size;
+    *denied_sids = deny_sids;
+    *denied_size = deny_size;
+
+ done:
+
+    if (ret) {
+      DEBUG(SSSDBG_CRIT_FAILURE, "Error encountered: %d.\n", ret);
+    }
+
+    ini_config_file_close(file_ctx);
+    return ret;
+}
+
+static void
+sssd_krb_get_auth_data_fn(const char * pServer,
+                     const char * pShare,
+                     char * pWorkgroup,
+                     int maxLenWorkgroup,
+                     char * pUsername,
+                     int maxLenUsername,
+                     char * pPassword,
+                     int maxLenPassword)
+{
+    /* since we are using kerberos for authentication, we simply return */
+    return;
+}
+
+
+/*
+ * This cse-specific function (GP_EXT_GUID_SECURITY) opens an SMB connection,
+ * retrieves the data referenced by the input smb_uri, and then closes the SMB
+ * connection. The data is then parsed and the results are used to populate the
+ * output parameters with the list of allowed_sids and denied_sids
+ */
+static errno_t
+process_security_settings_cse(TALLOC_CTX *mem_ctx,
+                              const char *smb_uri,
+                              char ***_allowed_sids,
+                              int *_allowed_size,
+                              char ***_denied_sids,
+                              int *_denied_size)
+{
+    SMBCCTX *context;
+    int ret = 0;
+    uint8_t *buf = NULL;
+    int bytesread = 0;
+
+    char **allowed_sids;
+    char **denied_sids;
+    int allowed_size = 0;
+    int denied_size = 0;
+
+    DEBUG(SSSDBG_TRACE_ALL, "%s\n", smb_uri);
+
+    context = smbc_new_context();
+    if (!context) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "Could not allocate new smbc context\n");
+    }
+
+    smbc_setFunctionAuthData(context, sssd_krb_get_auth_data_fn);
+    smbc_setOptionUseKerberos(context, 1);
+    /* TBD: figure out whether we need the following function call */
+    /* smbc_setOptionFallbackAfterKerberos(context, 1); */
+
+    /* Initialize the context using the previously specified options */
+    if (!smbc_init_context(context)) {
+        smbc_free_context(context, 0);
+        DEBUG(SSSDBG_CRIT_FAILURE, "Could not initialize smbc context\n");
+    }
+
+    /* Tell the compatibility layer to use this context */
+    smbc_set_context(context);
+
+    int remotehandle = smbc_open(smb_uri, O_RDONLY, 0755);
+    if (remotehandle < 0) DEBUG(SSSDBG_CRIT_FAILURE, "smbc_open failed\n");
+
+    buf = talloc_array(mem_ctx, uint8_t, SMB_BUFFER_SIZE);
+    bytesread = smbc_read(remotehandle, buf, SMB_BUFFER_SIZE);
+    if(bytesread < 0) DEBUG(SSSDBG_CRIT_FAILURE, "smbc_read failed\n");
+
+    DEBUG(SSSDBG_CRIT_FAILURE, "bytesread: %d\n", bytesread);
+
+    smbc_close(remotehandle);
+
+    ret = ad_gpo_parse_security_cse_buffer(buf,
+                                           bytesread,
+                                           &allowed_sids,
+                                           &allowed_size,
+                                           &denied_sids,
+                                           &denied_size);
+
+    /* TBD: allowed/denied_sids/size should be stored in cache */
+
+    *_allowed_sids = allowed_sids;
+    *_allowed_size = allowed_size;
+    *_denied_sids = denied_sids;
+    *_denied_size = denied_size;
+
+    return ret;
+}
+
+/* == ad_gpo_process_cse_send/recv implementation ========================== */
+
+struct ad_gpo_process_cse_state {
+    struct tevent_context *ev;
+    char **allowed_sids;
+    int allowed_size;
+    char **denied_sids;
+    int denied_size;
+    struct gp_gpo *cse_filtered_gpo;
+};
+
+/*
+ * This cse-specific function (GP_EXT_GUID_SECURITY) retrieves the data
+ * referenced by the input smb_uri, and uses the parsed results to populate the
+ * state's list of allowed_sids and denied_sids.
+ */
+struct tevent_req *
+ad_gpo_process_cse_send(TALLOC_CTX *mem_ctx,
+                        struct tevent_context *ev,
+                        char *smb_uri,
+                        struct gp_gpo *cse_filtered_gpo)
+{
+    struct tevent_req *req;
+    struct ad_gpo_process_cse_state *state;
+    errno_t ret;
+
+    char **allowed_sids;
+    int allowed_size;
+    char **denied_sids;
+    int denied_size;
+
+    req = tevent_req_create(mem_ctx, &state, struct ad_gpo_process_cse_state);
+    if (req == NULL) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "tevent_req_create() failed\n");
+        return NULL;
+    }
+
+    state->ev = ev;
+    state->cse_filtered_gpo = cse_filtered_gpo;
+
+    ret = process_security_settings_cse
+        (state, smb_uri, &allowed_sids, &allowed_size, &denied_sids, &denied_size);
+
+   if (ret != EOK) {
+       DEBUG(SSSDBG_CRIT_FAILURE, "process_security_settings_cse FAILED\n");
+       goto done;
+    }
+
+   state->allowed_sids = allowed_sids;
+   state->allowed_size = allowed_size;
+   state->denied_sids = denied_sids;
+   state->denied_size = denied_size;
+
+   ret = EOK;
+
+ done:
+
+    if (ret == EOK) {
+        tevent_req_done(req);
+        tevent_req_post(req, ev);
+    } else {
+       tevent_req_error(req, ret);
+       tevent_req_post(req, ev);
+   }
+
+   return req;
+}
+
+int ad_gpo_process_cse_recv(struct tevent_req *req,
+                            TALLOC_CTX *mem_ctx,
+                            char ***allowed_sids,
+                            int *allowed_size,
+                            char ***denied_sids,
+                            int *denied_size)
+{
+    struct ad_gpo_process_cse_state *state =
+        tevent_req_data(req, struct ad_gpo_process_cse_state);
+
+    TEVENT_REQ_RETURN_ON_ERROR(req);
+
+    *allowed_sids = state->allowed_sids;
+    *allowed_size = state->allowed_size;
+    *denied_sids = state->denied_sids;
+    *denied_size = state->denied_size;
+
+    return EOK;
+}
+
+//
+// ssh allowed_user@foo.com@localhost should yield:
+//   [ad_gpo_site_dn_retrieval_done]
+//     som_list[0]->som_dn is OU=West OU,OU=Sales OU,DC=foo,DC=com
+//     som_list[1]->som_dn is OU=Sales OU,DC=foo,DC=com
+//     som_list[2]->som_dn is DC=foo,DC=com
+//     som_list[3]->som_dn is cn=Default-First-Site-Name,cn=Sites,CN=Config...
+//   [ad_gpo_populate_candidate_gpos]
+//     candidate_gpos[0]->gpo_dn: cn={2FA3DF15-54AD-440A-85D9-7A6830DCED3E},...
+//     candidate_gpos[1]->gpo_dn: cn={5ABFCFCB-51B5-4727-B794-86BF28FFDC96},...
+//     candidate_gpos[2]->gpo_dn: cn={B66859F5-6871-4FE2-8506-BFEB524CDAC8},...
+//     candidate_gpos[3]->gpo_dn: cn={66B30995-41DB-45B9-A42B-44E0A68765BB},...
+//   [ad_gpo_process_gpo_done]
+//     dacl_filtered_gpos[0]->gpo_guid is {5ABFCFCB-51B5-4727-B794-86BF28FFDC96}
+//     dacl_filtered_gpos[1]->gpo_guid is {B66859F5-6871-4FE2-8506-BFEB524CDAC8}
+//     dacl_filtered_gpos[2]->gpo_guid is {66B30995-41DB-45B9-A42B-44E0A68765BB}
+//   [ad_gpo_process_gpo_done]
+//     cse_filtered_gpos[0]->gpo_guid is {5ABFCFCB-51B5-4727-B794-86BF28FFDC96}
+//     cse_filtered_gpos[1]->gpo_guid is {66B30995-41DB-45B9-A42B-44E0A68765BB}
+//     num_cse_filtered_gpos: 2
+//     cse filtered_gpos[0]->gpo_guid is {5ABFCFCB-51B5-4727-B794-86BF28FFDC96}
+//   [process_security_settings_cse]
+//     smb://foo.com/SysVol/foo.com/Policies/{{5ABF,66B3}}/Machine/Microsoft/Windows NT/SecEdit/GptTmpl.inf
+//     bytesread: {340,360}
+
+// ssh denied_user@foo.com@localhost should yield:
+//   [ad_gpo_site_dn_retrieval_done]
+//     som_list[0]->som_dn is OU=West OU,OU=Sales OU,DC=foo,DC=com
+//     som_list[1]->som_dn is OU=Sales OU,DC=foo,DC=com
+//     som_list[2]->som_dn is DC=foo,DC=com
+//     som_list[3]->som_dn is cn=Default-First-Site-Name,cn=Sites,CN=Config...
+//   [ad_gpo_populate_candidate_gpos]
+//     candidate_gpos[0]->gpo_dn: cn={2FA3DF15-54AD-440A-85D9-7A6830DCED3E},...
+//     candidate_gpos[1]->gpo_dn: cn={5ABFCFCB-51B5-4727-B794-86BF28FFDC96},...
+//     candidate_gpos[2]->gpo_dn: cn={B66859F5-6871-4FE2-8506-BFEB524CDAC8},...
+//     candidate_gpos[3]->gpo_dn: cn={66B30995-41DB-45B9-A42B-44E0A68765BB},...
+//   [ad_gpo_process_gpo_done]
+//     dacl_filtered_gpos[0]->gpo_guid is {2FA3DF15-54AD-440A-85D9-7A6830DCED3E}
+//     dacl_filtered_gpos[1]->gpo_guid is {5ABFCFCB-51B5-4727-B794-86BF28FFDC96}
+//     dacl_filtered_gpos[2]->gpo_guid is {B66859F5-6871-4FE2-8506-BFEB524CDAC8}
+//     dacl_filtered_gpos[3]->gpo_guid is {66B30995-41DB-45B9-A42B-44E0A68765BB}
+//   [ad_gpo_process_gpo_done]
+//     cse_filtered_gpos[0]->gpo_guid is {2FA3DF15-54AD-440A-85D9-7A6830DCED3E}
+//     cse_filtered_gpos[1]->gpo_guid is {5ABFCFCB-51B5-4727-B794-86BF28FFDC96}
+//     cse_filtered_gpos[2]->gpo_guid is {66B30995-41DB-45B9-A42B-44E0A68765BB}
+//     num_cse_filtered_gpos: 3
+//     cse filtered_gpos[0]->gpo_guid is {5ABFCFCB-51B5-4727-B794-86BF28FFDC96}
+//   [process_security_settings_cse]
+//     smb://foo.com/SysVol/foo.com/Policies/{{2FA3,5ABF}}/Machine/Microsoft/Windows NT/SecEdit/GptTmpl.inf
+//     bytesread: {340,340}
+
+
+// denied_user         => S-1-5-21-1175337206-4250576914-2321192831-1142
+//     group_sids[0] = S-1-5-21-1175337206-4250576914-2321192831-513
+//     group_sids[1] = S-1-5-11
+// allowed_denied_user => S-1-5-21-1175337206-4250576914-2321192831-1144
+// allowed_user        => S-1-5-21-1175337206-4250576914-2321192831-1103
+//     group_sids[0] = S-1-5-21-1175337206-4250576914-2321192831-513
+//     group_sids[1] = S-1-5-11
+// Administrator       => S-1-5-21-1175337206-4250576914-2321192831-500
+
+// {5ABFCFCB-51B5-4727-B794-86BF28FFDC96}: "deny_denied_user"
+// denied_sids: -1142 (denied_user)
+//   [Privilege Rights]
+//   SeDenyInteractiveLogonRight = *S-1-5-21-...2321192831-1142
+//
+// {66B30995-41DB-45B9-A42B-44E0A68765BB}: "allow_denied_user"
+// allowed_sids: -1142, -544 (denied_user, Administrators group)
+//   [Privilege Rights]
+//   SeInteractiveLogonRight = *S-1-5-21-...2321192831-1142,*S-1-5-32-544
+//
+//

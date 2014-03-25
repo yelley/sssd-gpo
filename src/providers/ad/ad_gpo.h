@@ -43,10 +43,10 @@
  */
 struct tevent_req *
 ad_gpo_access_send(TALLOC_CTX *mem_ctx,
-                       struct tevent_context *ev,
-                       struct sss_domain_info *domain,
-                       struct ad_access_ctx *ctx,
-                       char *user);
+                   struct tevent_context *ev,
+                   struct sss_domain_info *domain,
+                   struct ad_access_ctx *ctx,
+                   char *user);
 
 errno_t ad_gpo_access_recv(struct tevent_req *req);
 
