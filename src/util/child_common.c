@@ -418,7 +418,6 @@ struct tevent_req *read_pipe_send(TALLOC_CTX *mem_ctx,
     struct tevent_req *req;
     struct read_pipe_state *state;
     struct tevent_fd *fde;
-
     req = tevent_req_create(mem_ctx, &state, struct read_pipe_state);
     if (req == NULL) return NULL;
 
@@ -450,7 +449,6 @@ static void read_pipe_handler(struct tevent_context *ev,
     ssize_t size;
     errno_t err;
     uint8_t buf[CHILD_MSG_CHUNK];
-
     if (flags & TEVENT_FD_WRITE) {
         DEBUG(SSSDBG_CRIT_FAILURE, "read_pipe_done called with TEVENT_FD_WRITE,"
                   " this should not happen.\n");
@@ -461,6 +459,7 @@ static void read_pipe_handler(struct tevent_context *ev,
     size = sss_atomic_read_s(state->fd,
                 buf,
                 CHILD_MSG_CHUNK);
+
     if (size == -1) {
         err = errno;
         DEBUG(SSSDBG_CRIT_FAILURE,

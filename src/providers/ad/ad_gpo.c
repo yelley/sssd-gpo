@@ -1,25 +1,25 @@
 /*
-  SSSD
+    SSSD
 
-  ad_gpo.c
+    ad_gpo.c
 
-  Authors:
-  Yassir Elley <yelley@redhat.com>
+    Authors:
+    Yassir Elley <yelley@redhat.com>
 
-  Copyright (C) 2013 Red Hat
+    Copyright (C) 2013 Red Hat
 
-  This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation; either version 3 of the License, or
-  (at your option) any later version.
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 3 of the License, or
+    (at your option) any later version.
 
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
 
-  You should have received a copy of the GNU General Public License
-  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
 /*
@@ -34,10 +34,8 @@
  */
 
 #include <security/pam_modules.h>
-#include <samba-4.0/libsmbclient.h>
-#include <ini_configobj.h>
-#include <ini_config.h>
 #include "util/util.h"
+#include "util/child_common.h"
 #include "providers/data_provider.h"
 #include "providers/dp_backend.h"
 #include "providers/ad/ad_access.h"
@@ -73,15 +71,17 @@
 #define GPO_VERSION_USER(x) (x >> 16)
 #define GPO_VERSION_MACHINE(x) (x & 0xffff)
 
-#define RIGHTS_SECTION "Privilege Rights"
-#define ALLOW_LOGON_LOCALLY "SeInteractiveLogonRight"
-#define DENY_LOGON_LOCALLY "SeDenyInteractiveLogonRight"
-
-#define SMB_BUFFER_SIZE 65536
-
 #define GP_EXT_GUID_SECURITY "{827D319E-6EAC-11D2-A4EA-00C04F79F83A}"
 #define GP_EXT_GUID_SECURITY_SUFFIX "/Microsoft/Windows NT/SecEdit/GptTmpl.inf"
 
+#ifndef SSSD_LIBEXEC_PATH
+#error "SSSD_LIBEXEC_PATH not defined"
+#else
+#define GPO_CHILD SSSD_LIBEXEC_PATH"/gpo_child"
+#endif
+
+/* fd used by the gpo_child process for logging */
+int gpo_child_debug_fd = -1;
 
 /* == common data structures and declarations ============================= */
 
@@ -102,7 +102,7 @@ struct gp_gpo {
     char *gpo_guid;
     char *gpo_display_name;
     char *gpo_file_sys_path;
-    uint32_t gpo_container_version_number;
+    uint32_t gpo_container_version;
     char **gpo_cse_guids;
     int num_gpo_cse_guids;
     int gpo_func_version;
@@ -142,13 +142,13 @@ struct tevent_req *
 ad_gpo_process_cse_send(TALLOC_CTX *mem_ctx,
                         struct tevent_context *ev,
                         char *smb_uri,
-                        struct gp_gpo *cse_filtered_gpo);
+                        uint32_t gpo_container_version);
 int ad_gpo_process_cse_recv(struct tevent_req *req,
                             TALLOC_CTX *mem_ctx,
-                            char ***allowed_sids,
                             int *allowed_size,
-                            char ***denied_sids,
-                            int *denied_size);
+                            char ***allowed_sids,
+                            int *denied_size,
+                            char ***denied_sids);
 
 /* == ad_gpo_access_send/recv helpers =======================================*/
 
@@ -749,6 +749,32 @@ ad_gpo_access_check(TALLOC_CTX *mem_ctx,
     return ret;
 }
 
+#define GPO_CHILD_LOG_FILE "gpo_child"
+static errno_t gpo_child_init(void)
+{
+    int ret;
+    FILE *debug_filep;
+
+    if (debug_to_file != 0 && gpo_child_debug_fd == -1) {
+        ret = open_debug_file_ex(GPO_CHILD_LOG_FILE, &debug_filep, false);
+        if (ret != EOK) {
+            DEBUG(SSSDBG_FATAL_FAILURE, "Error setting up logging (%d) [%s]\n",
+                        ret, strerror(ret));
+            return ret;
+        }
+
+        gpo_child_debug_fd = fileno(debug_filep);
+        if (gpo_child_debug_fd == -1) {
+            DEBUG(SSSDBG_FATAL_FAILURE,
+                  "fileno failed [%d][%s]\n", errno, strerror(errno));
+            ret = errno;
+            return ret;
+        }
+    }
+
+    return EOK;
+}
+
 /* == ad_gpo_access_send/recv implementation ================================*/
 
 struct ad_gpo_access_state {
@@ -786,6 +812,9 @@ ad_gpo_access_send(TALLOC_CTX *mem_ctx,
     struct tevent_req *subreq;
     struct ad_gpo_access_state *state;
     errno_t ret;
+
+    /* setup logging for gpo child */
+    gpo_child_init();
 
     req = tevent_req_create(mem_ctx, &state, struct ad_gpo_access_state);
     if (req == NULL) {
@@ -1178,7 +1207,8 @@ static errno_t ad_gpo_cse_step(struct tevent_req *req)
                               cse_filtered_gpo->gpo_file_sys_path,
                               GP_EXT_GUID_SECURITY_SUFFIX);
 
-    subreq = ad_gpo_process_cse_send(state, state->ev, smb_uri, cse_filtered_gpo);
+    subreq = ad_gpo_process_cse_send(state, state->ev, smb_uri,
+                                     cse_filtered_gpo->gpo_container_version);
 
     tevent_req_set_callback(subreq, ad_gpo_cse_done, req);
     return EAGAIN;
@@ -1207,8 +1237,12 @@ ad_gpo_cse_done(struct tevent_req *subreq)
     req = tevent_req_callback_data(subreq, struct tevent_req);
     state = tevent_req_data(req, struct ad_gpo_access_state);
 
-    ret = ad_gpo_process_cse_recv(subreq, state, &allowed_sids, &allowed_size,
-                                  &denied_sids, &denied_size);
+
+    ret = ad_gpo_process_cse_recv(subreq, state,
+                                  &allowed_size,
+                                  &allowed_sids,
+                                  &denied_size,
+                                  &denied_sids);
 
     talloc_zfree(subreq);
 
@@ -1217,18 +1251,12 @@ ad_gpo_cse_done(struct tevent_req *subreq)
         goto done;
     }
 
-    /* TBD: allowed/denied_sids/size, should be retrieved from cache */
     ret = ad_gpo_access_check
         (state, state->user, state->domain,
          allowed_sids, allowed_size, denied_sids, denied_size);
 
-    if (ret == EOK) {
-        DEBUG(SSSDBG_CRIT_FAILURE, "ret is EOK\n");
-    } else {
-        DEBUG(SSSDBG_CRIT_FAILURE, "ret is not EOK\n");
-        DEBUG(SSSDBG_OP_FAILURE,
-              "GPO check failed: [%d](%s)\n",
-              ret, strerror(ret));
+    if (ret != EOK) {
+        /* TBD: handle ret error  */
         goto done;
     }
 
@@ -2491,7 +2519,7 @@ ad_gpo_get_gpo_attrs_done(struct tevent_req *subreq)
 
     /* retrieve AD_AT_VERSION_NUMBER */
     ret = sysdb_attrs_get_uint32_t(results[0], AD_AT_VERSION_NUMBER,
-                                   &gp_gpo->gpo_container_version_number);
+                                   &gp_gpo->gpo_container_version);
     if (ret != EOK) {
         DEBUG(SSSDBG_OP_FAILURE,
               "sysdb_attrs_get_uint32_t failed: [%d](%s)\n",
@@ -2499,8 +2527,8 @@ ad_gpo_get_gpo_attrs_done(struct tevent_req *subreq)
         goto done;
     }
 
-    DEBUG(SSSDBG_TRACE_ALL, "gpo_container_version_number: %d\n",
-                            gp_gpo->gpo_container_version_number);
+    DEBUG(SSSDBG_TRACE_ALL, "gpo_container_version: %d\n",
+                            gp_gpo->gpo_container_version);
 
     /* retrieve AD_AT_MACHINE_EXT_NAMES */
     ret = sysdb_attrs_get_el(results[0], AD_AT_MACHINE_EXT_NAMES, &el);
@@ -2597,194 +2625,180 @@ ad_gpo_process_gpo_recv(struct tevent_req *req,
 
 /* == ad_gpo_process_cse_send/recv helpers ================================= */
 
-static errno_t
-parse_logon_right_with_libini(struct ini_cfgobj *ini_config,
-                              const char *section,
-                              const char *name,
-                              int *_size,
-                              char ***_sids)
+static errno_t create_cse_send_buffer(TALLOC_CTX *mem_ctx,
+                                      char *smb_uri,
+                                      uint32_t gpo_container_version,
+                                      struct io_buffer **io_buf)
 {
-  int ret = 0;
-  struct value_obj *vobj = NULL;
-  char **sids = NULL;
-  int num_sids;
-  int i;
+    struct io_buffer *buf;
+    size_t rp;
 
-  ret = ini_get_config_valueobj(section, name, ini_config, INI_GET_FIRST_VALUE,
-                                &vobj);
-  if (vobj == NULL) {
-      DEBUG(SSSDBG_CRIT_FAILURE, "section/name not found: [%s][%s]\n",
-            section, name);
-      return EOK;
-  }
-  sids = ini_get_string_config_array(vobj, NULL, &num_sids, &ret);
+    DEBUG(SSSDBG_TRACE_ALL, "smb_uri: %s\n", smb_uri);
+    DEBUG(SSSDBG_TRACE_ALL, "strlen(smb_uri): %zu\n", strlen(smb_uri));
 
-  if (ret) {
-      DEBUG(SSSDBG_CRIT_FAILURE,
-            "ini_get_string_config_array failed [%d][%s]\n", ret, strerror(ret));
-      return ret;
-  }
-
-  for (i = 0; i <num_sids; i++) {
-    if (sids[i][0] == '*') {
-      sids[i]++;
-    }
-  }
-
-  *_size = num_sids;
-  *_sids = sids;
-
-  return EOK;
-}
-
-static errno_t
-ad_gpo_parse_security_cse_buffer(uint8_t *data_buf,
-                                 int data_len,
-                                 char ***allowed_sids,
-                                 int *allowed_size,
-                                 char ***denied_sids,
-                                 int *denied_size)
-{
-    struct ini_cfgfile *file_ctx = NULL;
-    struct ini_cfgobj *ini_config = NULL;
-    int ret;
-    char **allow_sids = NULL; char **deny_sids = NULL;
-    int allow_size = 0; int deny_size = 0;
-
-    ret = ini_config_create(&ini_config);
-    if (ret) goto done;
-    ret = ini_config_file_from_mem(data_buf, data_len, &file_ctx);
-    if (ret) goto done;
-    ret = ini_config_parse(file_ctx, INI_STOP_ON_NONE, 0, 0, ini_config);
-    if (ret) goto done;
-
-    ret = parse_logon_right_with_libini(ini_config,
-                                        RIGHTS_SECTION,
-                                        ALLOW_LOGON_LOCALLY,
-                                        &allow_size,
-                                        &allow_sids);
-    if (ret) {goto done;}
-
-    ret = parse_logon_right_with_libini(ini_config,
-                                        RIGHTS_SECTION,
-                                        DENY_LOGON_LOCALLY,
-                                        &deny_size,
-                                        &deny_sids);
-    if (ret) {goto done;}
-
-    *allowed_sids = allow_sids;
-    *allowed_size = allow_size;
-    *denied_sids = deny_sids;
-    *denied_size = deny_size;
-
- done:
-
-    if (ret) {
-      DEBUG(SSSDBG_CRIT_FAILURE, "Error encountered: %d.\n", ret);
+    buf = talloc(mem_ctx, struct io_buffer);
+    if (buf == NULL) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "talloc failed.\n");
+        return ENOMEM;
     }
 
-    ini_config_file_close(file_ctx);
-    return ret;
+    buf->size = 1 * sizeof(uint32_t);
+    if (smb_uri) {
+        buf->size += strlen(smb_uri);
+    }
+
+    DEBUG(SSSDBG_TRACE_ALL, "buffer size: %zu\n", buf->size);
+
+    buf->data = talloc_size(buf, buf->size);
+    if (buf->data == NULL) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "talloc_size failed.\n");
+        talloc_free(buf);
+        return ENOMEM;
+    }
+
+    rp = 0;
+    /* smb_uri */
+    if (smb_uri) {
+        SAFEALIGN_SET_UINT32(&buf->data[rp], strlen(smb_uri), &rp);
+        safealign_memcpy(&buf->data[rp], smb_uri, strlen(smb_uri), &rp);
+    } else {
+        SAFEALIGN_SET_UINT32(&buf->data[rp], 0, &rp);
+    }
+
+    *io_buf = buf;
+    return EOK;
 }
 
-static void
-sssd_krb_get_auth_data_fn(const char * pServer,
-                     const char * pShare,
-                     char * pWorkgroup,
-                     int maxLenWorkgroup,
-                     char * pUsername,
-                     int maxLenUsername,
-                     char * pPassword,
-                     int maxLenPassword)
+
+static int parse_gpo_child_response(TALLOC_CTX *mem_ctx,
+                                    uint8_t *buf, ssize_t size,
+                                    char ***_allowed_sids,
+                                    int *_allowed_size,
+                                    char ***_denied_sids,
+                                    int *_denied_size)
 {
-    /* since we are using kerberos for authentication, we simply return */
-    return;
-}
-
-
-/*
- * This cse-specific function (GP_EXT_GUID_SECURITY) opens an SMB connection,
- * retrieves the data referenced by the input smb_uri, and then closes the SMB
- * connection. The data is then parsed and the results are used to populate the
- * output parameters with the list of allowed_sids and denied_sids
- */
-static errno_t
-process_security_settings_cse(TALLOC_CTX *mem_ctx,
-                              const char *smb_uri,
-                              char ***_allowed_sids,
-                              int *_allowed_size,
-                              char ***_denied_sids,
-                              int *_denied_size)
-{
-    SMBCCTX *context;
-    int ret = 0;
-    uint8_t *buf = NULL;
-    int bytesread = 0;
-
-    char **allowed_sids;
-    char **denied_sids;
+    size_t p = 0;
+    uint32_t res;
     int allowed_size = 0;
     int denied_size = 0;
+    int i = 0;
+    int sid_len = 0;
+    char **allowed_sids;
+    char *allowed_sid;
+    char **denied_sids;
+    char *denied_sid;
 
-    DEBUG(SSSDBG_TRACE_ALL, "%s\n", smb_uri);
+    /* operation result code */
+    SAFEALIGN_COPY_UINT32_CHECK(&res, buf + p, size, &p);
 
-    context = smbc_new_context();
-    if (!context) {
-        DEBUG(SSSDBG_CRIT_FAILURE, "Could not allocate new smbc context\n");
+    /* allowed_size */
+    SAFEALIGN_COPY_UINT32_CHECK(&allowed_size, buf + p, size, &p);
+    DEBUG(SSSDBG_TRACE_FUNC, "child response allowed_size: %d\n", allowed_size);
+
+    allowed_sids = talloc_array(mem_ctx, char *, allowed_size + 1);
+    if (allowed_sids == NULL) {
+        return ENOMEM;
     }
 
-    smbc_setFunctionAuthData(context, sssd_krb_get_auth_data_fn);
-    smbc_setOptionUseKerberos(context, 1);
-    /* TBD: figure out whether we need the following function call */
-    /* smbc_setOptionFallbackAfterKerberos(context, 1); */
+    for (i = 0; i < allowed_size; i++) {
+        SAFEALIGN_COPY_UINT32_CHECK(&sid_len, buf + p, size, &p);
+        if ((p + sid_len ) > size) return EINVAL;
+        allowed_sid = talloc_size(mem_ctx, sizeof(char) * (sid_len + 1));
+        if (allowed_sid == NULL) {
+            DEBUG(SSSDBG_CRIT_FAILURE, "talloc_size failed.\n");
+            return ENOMEM;
+        }
+        safealign_memcpy(allowed_sid, buf+p, sizeof(char) * sid_len, &p);
+        allowed_sid[sid_len] = '\0';
 
-    /* Initialize the context using the previously specified options */
-    if (!smbc_init_context(context)) {
-        smbc_free_context(context, 0);
-        DEBUG(SSSDBG_CRIT_FAILURE, "Could not initialize smbc context\n");
+        allowed_sids[i] = talloc_strdup(allowed_sids, allowed_sid);
+        if (allowed_sids[i] == NULL) {
+            return ENOMEM;
+        }
     }
 
-    /* Tell the compatibility layer to use this context */
-    smbc_set_context(context);
+    /* denied_size */
+    SAFEALIGN_COPY_UINT32_CHECK(&denied_size, buf + p, size, &p);
+    DEBUG(SSSDBG_TRACE_FUNC, "child response denied_size: %d\n", denied_size);
 
-    int remotehandle = smbc_open(smb_uri, O_RDONLY, 0755);
-    if (remotehandle < 0) DEBUG(SSSDBG_CRIT_FAILURE, "smbc_open failed\n");
+    denied_sids = talloc_array(mem_ctx, char *, denied_size + 1);
+    if (denied_sids == NULL) {
+        return ENOMEM;
+    }
 
-    buf = talloc_array(mem_ctx, uint8_t, SMB_BUFFER_SIZE);
-    bytesread = smbc_read(remotehandle, buf, SMB_BUFFER_SIZE);
-    if(bytesread < 0) DEBUG(SSSDBG_CRIT_FAILURE, "smbc_read failed\n");
+    for (i = 0; i < denied_size; i++) {
+        SAFEALIGN_COPY_UINT32_CHECK(&sid_len, buf + p, size, &p);
+        if ((p + sid_len ) > size) return EINVAL;
+        denied_sid = talloc_size(mem_ctx, sizeof(char) * (sid_len + 1));
+        if (denied_sid == NULL) {
+            DEBUG(SSSDBG_CRIT_FAILURE, "talloc_size failed.\n");
+            return ENOMEM;
+        }
+        safealign_memcpy(denied_sid, buf+p, sizeof(char) * sid_len, &p);
+        denied_sid[sid_len] = '\0';
 
-    DEBUG(SSSDBG_CRIT_FAILURE, "bytesread: %d\n", bytesread);
+        denied_sids[i] = talloc_strdup(denied_sids, denied_sid);
+        if (denied_sids[i] == NULL) {
+            return ENOMEM;
+        }
+    }
 
-    smbc_close(remotehandle);
-
-    ret = ad_gpo_parse_security_cse_buffer(buf,
-                                           bytesread,
-                                           &allowed_sids,
-                                           &allowed_size,
-                                           &denied_sids,
-                                           &denied_size);
-
-    /* TBD: allowed/denied_sids/size should be stored in cache */
-
-    *_allowed_sids = allowed_sids;
     *_allowed_size = allowed_size;
-    *_denied_sids = denied_sids;
+    *_allowed_sids = talloc_steal(mem_ctx, allowed_sids);
     *_denied_size = denied_size;
+    *_denied_sids = talloc_steal(mem_ctx, denied_sids);
 
-    return ret;
+    return EOK;
 }
 
 /* == ad_gpo_process_cse_send/recv implementation ========================== */
 
 struct ad_gpo_process_cse_state {
     struct tevent_context *ev;
-    char **allowed_sids;
-    int allowed_size;
-    char **denied_sids;
-    int denied_size;
-    struct gp_gpo *cse_filtered_gpo;
+    uint32_t gpo_container_version;
+    pid_t child_pid;
+    uint8_t *buf;
+    ssize_t len;
+    struct io *io;
 };
+
+struct io {
+    int read_from_child_fd;
+    int write_to_child_fd;
+};
+
+static int gpo_child_io_destructor(void *ptr)
+{
+    int ret;
+    struct io *io = talloc_get_type(ptr, struct io);
+    if (io == NULL) return EOK;
+
+    if (io->write_to_child_fd != -1) {
+        ret = close(io->write_to_child_fd);
+        io->write_to_child_fd = -1;
+        if (ret != EOK) {
+            ret = errno;
+            DEBUG(SSSDBG_CRIT_FAILURE,
+                  "close failed [%d][%s].\n", ret, strerror(ret));
+        }
+    }
+
+    if (io->read_from_child_fd != -1) {
+        ret = close(io->read_from_child_fd);
+        io->read_from_child_fd = -1;
+        if (ret != EOK) {
+            ret = errno;
+            DEBUG(SSSDBG_CRIT_FAILURE,
+                  "close failed [%d][%s].\n", ret, strerror(ret));
+        }
+    }
+
+    return EOK;
+}
+
+static errno_t gpo_fork_child(struct tevent_req *req);
+static void gpo_cse_step(struct tevent_req *subreq);
+static void gpo_cse_done(struct tevent_req *subreq);
 
 /*
  * This cse-specific function (GP_EXT_GUID_SECURITY) retrieves the data
@@ -2795,16 +2809,12 @@ struct tevent_req *
 ad_gpo_process_cse_send(TALLOC_CTX *mem_ctx,
                         struct tevent_context *ev,
                         char *smb_uri,
-                        struct gp_gpo *cse_filtered_gpo)
+                        uint32_t gpo_container_version)
 {
-    struct tevent_req *req;
+    struct tevent_req *req, *subreq;
     struct ad_gpo_process_cse_state *state;
+    struct io_buffer *buf = NULL;
     errno_t ret;
-
-    char **allowed_sids;
-    int allowed_size;
-    char **denied_sids;
-    int denied_size;
 
     req = tevent_req_create(mem_ctx, &state, struct ad_gpo_process_cse_state);
     if (req == NULL) {
@@ -2813,52 +2823,195 @@ ad_gpo_process_cse_send(TALLOC_CTX *mem_ctx,
     }
 
     state->ev = ev;
-    state->cse_filtered_gpo = cse_filtered_gpo;
+    state->gpo_container_version = gpo_container_version;
+    state->buf = NULL;
+    state->len = 0;
 
-    ret = process_security_settings_cse
-        (state, smb_uri, &allowed_sids, &allowed_size, &denied_sids, &denied_size);
-
-   if (ret != EOK) {
-       DEBUG(SSSDBG_CRIT_FAILURE, "process_security_settings_cse FAILED\n");
-       goto done;
+    state->io = talloc(state, struct io);
+    if (state->io == NULL) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "talloc failed.\n");
+        ret = ENOMEM;
+        goto fail;
     }
 
-   state->allowed_sids = allowed_sids;
-   state->allowed_size = allowed_size;
-   state->denied_sids = denied_sids;
-   state->denied_size = denied_size;
+    state->io->write_to_child_fd = -1;
+    state->io->read_from_child_fd = -1;
+    talloc_set_destructor((void *) state->io, gpo_child_io_destructor);
 
-   ret = EOK;
+    /* prepare the data to pass to child */
+    ret = create_cse_send_buffer(state, smb_uri, gpo_container_version, &buf);
+    if (ret != EOK) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "create_cse_send_buffer failed.\n");
+        goto fail;
+    }
 
- done:
+    ret = gpo_fork_child(req);
+    if (ret != EOK) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "gpo_fork_child failed.\n");
+        goto fail;
+    }
 
-    if (ret == EOK) {
-        tevent_req_done(req);
-        tevent_req_post(req, ev);
-    } else {
-       tevent_req_error(req, ret);
-       tevent_req_post(req, ev);
-   }
+    subreq = write_pipe_send(state, ev, buf->data, buf->size,
+                             state->io->write_to_child_fd);
+    if (!subreq) {
+        ret = ENOMEM;
+        goto fail;
+    }
+    tevent_req_set_callback(subreq, gpo_cse_step, req);
 
-   return req;
+    return req;
+
+fail:
+    tevent_req_error(req, ret);
+    tevent_req_post(req, ev);
+    return req;
+}
+
+static void gpo_cse_step(struct tevent_req *subreq)
+{
+    struct tevent_req *req = tevent_req_callback_data(subreq,
+                                                      struct tevent_req);
+    struct ad_gpo_process_cse_state *state =
+        tevent_req_data(req, struct ad_gpo_process_cse_state);
+    int ret;
+
+    ret = write_pipe_recv(subreq);
+    talloc_zfree(subreq);
+    if (ret != EOK) {
+        tevent_req_error(req, ret);
+        return;
+    }
+
+    close(state->io->write_to_child_fd);
+    state->io->write_to_child_fd = -1;
+
+
+    subreq = read_pipe_send(state, state->ev, state->io->read_from_child_fd);
+
+    if (!subreq) {
+        tevent_req_error(req, ENOMEM);
+        return;
+    }
+    tevent_req_set_callback(subreq, gpo_cse_done, req);
+}
+
+static void gpo_cse_done(struct tevent_req *subreq)
+{
+    struct tevent_req *req = tevent_req_callback_data(subreq,
+                                                      struct tevent_req);
+    struct ad_gpo_process_cse_state *state =
+        tevent_req_data(req, struct ad_gpo_process_cse_state);
+    int ret;
+
+    ret = read_pipe_recv(subreq, state, &state->buf, &state->len);
+    talloc_zfree(subreq);
+    if (ret != EOK) {
+        tevent_req_error(req, ret);
+        return;
+    }
+
+    close(state->io->read_from_child_fd);
+    state->io->read_from_child_fd = -1;
+
+    tevent_req_done(req);
+    return;
 }
 
 int ad_gpo_process_cse_recv(struct tevent_req *req,
                             TALLOC_CTX *mem_ctx,
-                            char ***allowed_sids,
-                            int *allowed_size,
-                            char ***denied_sids,
-                            int *denied_size)
+                            int *_allowed_size,
+                            char ***_allowed_sids,
+                            int *_denied_size,
+                            char ***_denied_sids)
 {
+    char *smb_uri;
+    int ret;
+    char **allowed_sids;
+    int allowed_size;
+    char **denied_sids;
+    int denied_size;
+
     struct ad_gpo_process_cse_state *state =
         tevent_req_data(req, struct ad_gpo_process_cse_state);
 
     TEVENT_REQ_RETURN_ON_ERROR(req);
 
-    *allowed_sids = state->allowed_sids;
-    *allowed_size = state->allowed_size;
-    *denied_sids = state->denied_sids;
-    *denied_size = state->denied_size;
+    ret = parse_gpo_child_response(mem_ctx, state->buf, state->len,
+                                   &allowed_sids,
+                                   &allowed_size,
+                                   &denied_sids,
+                                   &denied_size);
+
+    if (ret != EOK) {
+        DEBUG(SSSDBG_CRIT_FAILURE,
+              "Cannot parse child response: [%d][%s]\n", ret, strerror(ret));
+        return ret;
+    }
+
+    *_allowed_size = allowed_size;
+    *_allowed_sids = talloc_steal(mem_ctx, allowed_sids);
+    *_denied_size = denied_size;
+    *_denied_sids = talloc_steal(mem_ctx, denied_sids);
+
+    return EOK;
+}
+
+static errno_t gpo_fork_child(struct tevent_req *req)
+{
+    int pipefd_to_child[2];
+    int pipefd_from_child[2];
+    pid_t pid;
+    int ret;
+    errno_t err;
+    struct ad_gpo_process_cse_state *state = tevent_req_data(req,
+                                                             struct ad_gpo_process_cse_state);
+
+    ret = pipe(pipefd_from_child);
+    if (ret == -1) {
+        err = errno;
+        DEBUG(SSSDBG_CRIT_FAILURE,
+              "pipe failed [%d][%s].\n", errno, strerror(errno));
+        return err;
+    }
+    ret = pipe(pipefd_to_child);
+    if (ret == -1) {
+        err = errno;
+        DEBUG(SSSDBG_CRIT_FAILURE,
+              "pipe failed [%d][%s].\n", errno, strerror(errno));
+        return err;
+    }
+
+    pid = fork();
+
+    if (pid == 0) { /* child */
+        err = exec_child(state,
+                         pipefd_to_child, pipefd_from_child,
+                         GPO_CHILD, gpo_child_debug_fd);
+        DEBUG(SSSDBG_CRIT_FAILURE, "Could not exec GPO child: [%d][%s].\n",
+              err, strerror(err));
+        return err;
+    } else if (pid > 0) { /* parent */
+        state->child_pid = pid;
+        state->io->read_from_child_fd = pipefd_from_child[0];
+        close(pipefd_from_child[1]);
+        state->io->write_to_child_fd = pipefd_to_child[1];
+        close(pipefd_to_child[0]);
+        fd_nonblocking(state->io->read_from_child_fd);
+        fd_nonblocking(state->io->write_to_child_fd);
+
+        ret = child_handler_setup(state->ev, pid, NULL, NULL, NULL);
+        if (ret != EOK) {
+            DEBUG(SSSDBG_CRIT_FAILURE,
+                  "Could not set up child signal handler\n");
+            return ret;
+        }
+
+    } else { /* error */
+        err = errno;
+        DEBUG(SSSDBG_CRIT_FAILURE,
+              "fork failed [%d][%s].\n", errno, strerror(errno));
+        return err;
+    }
 
     return EOK;
 }

@@ -106,6 +106,7 @@ sssdlibexec_PROGRAMS = \
     sssd_be \
     krb5_child \
     ldap_child \
+    gpo_child \
     proxy_child
 if BUILD_SUDO
 sssdlibexec_PROGRAMS += sssd_sudo
@@ -2042,8 +2043,7 @@ libsss_ad_la_CFLAGS = \
     $(SASL_CFLAGS) \
     $(DHASH_CFLAGS) \
     $(KRB5_CFLAGS) \
-    $(NDR_NBT_CFLAGS) \
-    $(SMBCLIENT_CFLAGS)
+    $(NDR_NBT_CFLAGS)
 libsss_ad_la_LIBADD = \
     $(SYSTEMD_LOGIN_LIBS) \
     $(OPENLDAP_LIBS) \
@@ -2052,7 +2052,6 @@ libsss_ad_la_LIBADD = \
     $(KEYUTILS_LIBS) \
     $(KRB5_LIBS) \
     $(NDR_NBT_LIBS) \
-    $(SMBCLIENT_LIBS) \
     libsss_ldap_common.la \
     libsss_krb5_common.la \
     libsss_idmap.la
@@ -2101,6 +2100,25 @@ ldap_child_LDADD = \
     $(POPT_LIBS) \
     $(DHASH_LIBS) \
     $(KRB5_LIBS)
+
+gpo_child_SOURCES = \
+    src/providers/ad/ad_gpo_child.c \
+    src/util/atomic_io.c \
+    src/util/util.c \
+    src/util/signal.c
+gpo_child_CFLAGS = \
+    $(AM_CFLAGS) \
+    $(POPT_CFLAGS) \
+    $(KRB5_CFLAGS) \
+    $(INI_CONFIG_CFLAGS) \
+    $(SMBCLIENT_CFLAGS)
+gpo_child_LDADD = \
+    libsss_debug.la \
+    $(TALLOC_LIBS) \
+    $(POPT_LIBS) \
+    $(DHASH_LIBS) \
+    $(INI_CONFIG_LIBS) \
+    $(SMBCLIENT_LIBS)
 
 proxy_child_SOURCES = \
     src/providers/proxy/proxy_child.c \
