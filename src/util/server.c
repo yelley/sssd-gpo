@@ -564,9 +564,11 @@ int server_setup(const char *name, int flags,
     if (flags & FLAGS_INTERACTIVE) {
         /* terminate when stdin goes away */
         stdin_event_flags = TEVENT_FD_READ;
+        debug_fg = true;
     } else {
         /* stay alive forever */
         stdin_event_flags = 0;
+        debug_fg = false;
     }
 
     /* catch EOF on stdin */

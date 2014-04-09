@@ -67,6 +67,7 @@ extern int debug_level;
 extern int debug_timestamps;
 extern int debug_microseconds;
 extern int debug_to_file;
+extern int debug_fg;
 extern const char *debug_log_file;
 void debug_fn(const char *file,
               long line,
