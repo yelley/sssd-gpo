@@ -45,6 +45,7 @@
 #include "providers/ldap/sdap_access.h"
 #include "providers/ldap/sdap_async.h"
 #include "providers/ldap/sdap.h"
+#include "util/util_sss_idmap.h"
 #include <ndr.h>
 #include <gen_ndr/security.h>
 
@@ -66,7 +67,6 @@
 #define UAC_WORKSTATION_TRUST_ACCOUNT 0x00001000
 #define AD_AGP_GUID "edacfd8f-ffb3-11d1-b41d-00a0c968f939"
 #define AD_AUTHENTICATED_USERS_SID "S-1-5-11"
-#define SID_MAX_LEN 1024
 
 #define GPO_VERSION_USER(x) (x >> 16)
 #define GPO_VERSION_MACHINE(x) (x & 0xffff)
@@ -152,6 +152,47 @@ int ad_gpo_process_cse_recv(struct tevent_req *req,
 
 /* == ad_gpo_access_send/recv helpers =======================================*/
 
+
+/*
+ * This function compares the Samba dom_sids and returns true if they are
+ * equal; otherwise, it returns false
+ */
+static bool
+ad_gpo_dom_sid_equal(const struct dom_sid *sid1, const struct dom_sid *sid2)
+{
+    int i;
+
+    if (sid1 == sid2) {
+        return true;
+    }
+
+    if (!sid1 || !sid2) {
+        return false;
+    }
+
+    if (sid1->sid_rev_num != sid2->sid_rev_num) {
+        return false;
+    }
+
+    for (i = 0; i < 6; i++) {
+        if (sid1->id_auth[i] != sid2->id_auth[i]) {
+            return false;
+        }
+    }
+
+    if (sid1->num_auths != sid2->num_auths) {
+        return false;
+    }
+
+    for (i = 0; i < sid1->num_auths-1; i++) {
+        if (sid1->sub_auths[i] != sid2->sub_auths[i]) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 /*
  * This function retrieves the SIDs corresponding to the input user and returns
  * the user_sid, group_sids, and group_size in their respective output params.
@@ -229,10 +270,6 @@ ad_gpo_get_sids(TALLOC_CTX *mem_ctx,
     return ret;
 }
 
-bool string_to_sid(struct dom_sid *sidout, const char *sidstr);
-int dom_sid_string_buf(const struct dom_sid *sid, char *buf, int buflen);
-bool dom_sid_equal(const struct dom_sid *sid1, const struct dom_sid *sid2);
-
 /*
  * This function determines whether the input ACE includes any of the
  * client's SIDs. The boolean result is assigned to the _included output param.
@@ -245,38 +282,99 @@ ad_gpo_ace_includes_client_sid(const char *user_sid,
                                bool *_included)
 {
     int i = 0;
+    int ret = 0;
     struct dom_sid ace_dom_sid;
-    struct dom_sid user_dom_sid;
-    struct dom_sid group_dom_sid;
-    char buf[SID_MAX_LEN + 1];
+    struct dom_sid *user_dom_sid;
+    struct dom_sid *group_dom_sid;
+    TALLOC_CTX *tmp_ctx;
+    struct sss_idmap_ctx *idmap_ctx;
+    enum idmap_error_code err;
+
+    tmp_ctx = talloc_new(NULL);
+    if (tmp_ctx == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
 
     ace_dom_sid = ace->trustee;
 
-    dom_sid_string_buf(&ace_dom_sid, buf, SID_MAX_LEN);
-
-    if (!string_to_sid(&user_dom_sid, user_sid)) {
-        DEBUG(SSSDBG_OP_FAILURE, "string_to_sid failed\n");
-        return EINVAL;
+    err = sss_idmap_init(sss_idmap_talloc, tmp_ctx, sss_idmap_talloc_free, &idmap_ctx);
+    if (err != IDMAP_SUCCESS) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "Failed to initialize idmap context.\n");
+        ret = EFAULT;
+        goto done;
     }
 
-    if (dom_sid_equal(&ace_dom_sid, &user_dom_sid)) {
+    err = sss_idmap_sid_to_smb_sid(idmap_ctx, user_sid, &user_dom_sid);
+    if (err != IDMAP_SUCCESS) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "Failed to initialize idmap context.\n");
+        ret = EFAULT;
+        goto done;
+    }
+
+    if (ad_gpo_dom_sid_equal(&ace_dom_sid, user_dom_sid)) {
         *_included = true;
-        return EOK;
+        ret = EOK;
+        goto done;
     }
 
     for (i = 0; i < group_size; i++) {
-        if (!string_to_sid(&group_dom_sid, group_sids[i])) {
-            DEBUG(SSSDBG_OP_FAILURE, "string_to_sid failed\n");
-            return EINVAL;
+        err = sss_idmap_sid_to_smb_sid(idmap_ctx, group_sids[i], &group_dom_sid);
+        if (err != IDMAP_SUCCESS) {
+            DEBUG(SSSDBG_CRIT_FAILURE, "Failed to initialize idmap context.\n");
+            ret = EFAULT;
+            goto done;
         }
-        if (dom_sid_equal(&ace_dom_sid, &group_dom_sid)) {
+
+        if (ad_gpo_dom_sid_equal(&ace_dom_sid, group_dom_sid)) {
             *_included = true;
-            return EOK;
+            ret = EOK;
+            goto done;
         }
     }
 
     *_included = false;
-    return EOK;
+
+    err = sss_idmap_init(sss_idmap_talloc, tmp_ctx, sss_idmap_talloc_free, &idmap_ctx);
+    if (err != IDMAP_SUCCESS) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "Failed to initialize idmap context.\n");
+        ret = EFAULT;
+        goto done;
+    }
+
+    err = sss_idmap_sid_to_smb_sid(idmap_ctx, user_sid, &user_dom_sid);
+    if (err != IDMAP_SUCCESS) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "Failed to initialize idmap context.\n");
+        ret = EFAULT;
+        goto done;
+    }
+
+    if (ad_gpo_dom_sid_equal(&ace_dom_sid, user_dom_sid)) {
+        *_included = true;
+        ret = EOK;
+        goto done;
+    }
+
+    for (i = 0; i < group_size; i++) {
+        err = sss_idmap_sid_to_smb_sid(idmap_ctx, group_sids[i], &group_dom_sid);
+        if (err != IDMAP_SUCCESS) {
+            DEBUG(SSSDBG_CRIT_FAILURE, "Failed to initialize idmap context.\n");
+            ret = EFAULT;
+            goto done;
+        }
+
+        if (ad_gpo_dom_sid_equal(&ace_dom_sid, group_dom_sid)) {
+            *_included = true;
+            ret = EOK;
+            goto done;
+        }
+    }
+
+    *_included = false;
+
+ done:
+    talloc_free(tmp_ctx);
+    return ret;
 }
 
 /*
@@ -1297,7 +1395,15 @@ static char *ad_gpo_parent_dn(const char *dn)
         return NULL;
     }
 
-    return p+1;
+    /* skip over the comma */
+    p++;
+
+    /* skip over any spaces */
+    while (*p == ' ') {
+        p++;
+    }
+
+    return p;
 }
 
 /*
@@ -2261,8 +2367,8 @@ ad_gpo_parse_machine_ext_names(TALLOC_CTX *mem_ctx,
 }
 
 enum ndr_err_code
-ndr_pull_security_descriptor(struct ndr_pull *ndr, int ndr_flags,
-                             struct security_descriptor *r);
+ad_gpo_ndr_pull_security_descriptor(struct ndr_pull *ndr, int ndr_flags,
+                                    struct security_descriptor *r);
 
 /*
  * This function parses the input data blob and assigns the resulting
@@ -2277,6 +2383,7 @@ static errno_t ad_gpo_parse_sd(TALLOC_CTX *mem_ctx,
     struct ndr_pull *ndr_pull = NULL;
     struct security_descriptor sd;
     DATA_BLOB blob;
+    enum ndr_err_code ndr_err;
 
     blob.data = data;
     blob.length = length;
@@ -2287,7 +2394,13 @@ static errno_t ad_gpo_parse_sd(TALLOC_CTX *mem_ctx,
         return EINVAL;
     }
 
-    ndr_pull_security_descriptor(ndr_pull, NDR_SCALARS|NDR_BUFFERS, &sd);
+    ndr_err =
+        ad_gpo_ndr_pull_security_descriptor(ndr_pull, NDR_SCALARS|NDR_BUFFERS, &sd);
+
+    if (ndr_err != NDR_ERR_SUCCESS) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "Failed to pull security descriptor\n");
+        return EINVAL;
+    }
 
     *_gpo_sd = talloc_memdup(mem_ctx, &sd, sizeof(struct security_descriptor));
 
